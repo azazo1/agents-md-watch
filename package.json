@@ -1,0 +1,15 @@
+{
+  "name": "agents-md-watch",
+  "version": "0.1.0",
+  "description": "Watch AGENTS.md changes for each Codex session with hook-driven alerts.",
+  "type": "module",
+  "packageManager": "bun@1.3.3",
+  "scripts": {
+    "test": "bun test",
+    "install:self": "bun ./install.ts",
+    "print:hooks": "bun ./install.ts --print-only"
+  },
+  "bin": {
+    "agents-md-watch-install": "./install.ts"
+  }
+}
