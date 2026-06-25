@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   mkdirSync,
@@ -187,6 +188,38 @@ describe("agents watch hook", () => {
     expect(result.response.continue).toBe(false);
     expect(result.response.stopReason).toBeString();
   });
+
+  test("removes database records older than thirty days", () => {
+    const ctx = createFixture();
+    const payload = { sessionId: "session-retention", cwd: ctx.cwd };
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    withDatabase(ctx.options.dbPath, (db) => {
+      insertSessionRecords(db, "old-session", "2026-05-20T12:00:00.000Z");
+      insertSessionRecords(db, "recent-session", "2026-06-10T12:00:00.000Z");
+    });
+
+    runHook({ command: "pre-tool" }, payload, ctx.options);
+
+    const oldCounts = readSessionRecordCounts(ctx.options.dbPath, "old-session");
+    const recentCounts = readSessionRecordCounts(
+      ctx.options.dbPath,
+      "recent-session",
+    );
+    const currentCounts = readSessionRecordCounts(
+      ctx.options.dbPath,
+      "session-retention",
+    );
+
+    expect(oldCounts.sessions).toBe(0);
+    expect(oldCounts.trackedFiles).toBe(0);
+    expect(oldCounts.alerts).toBe(0);
+    expect(recentCounts.sessions).toBe(1);
+    expect(recentCounts.trackedFiles).toBe(1);
+    expect(recentCounts.alerts).toBe(1);
+    expect(currentCounts.sessions).toBe(1);
+    expect(currentCounts.trackedFiles).toBeGreaterThan(0);
+  });
 });
 
 describe("agents watch installer", () => {
@@ -312,4 +345,98 @@ function createFixture(options?: {
       now: () => new Date(nowMs).toISOString(),
     },
   };
+}
+
+function withDatabase(dbPath: string, callback: (db: Database) => void): void {
+  const db = new Database(dbPath);
+
+  try {
+    callback(db);
+  } finally {
+    db.close();
+  }
+}
+
+function insertSessionRecords(
+  db: Database,
+  sessionKey: string,
+  createdAt: string,
+): void {
+  const filePath = `/tmp/${sessionKey}/AGENTS.md`;
+
+  db.prepare(`
+    INSERT INTO sessions (
+      session_key,
+      cwd,
+      project_root,
+      codex_home,
+      created_at,
+      ended_at,
+      status
+    ) VALUES (?, '/', '/', '/', ?, ?, 'stopped')
+  `).run(sessionKey, createdAt, createdAt);
+
+  db.prepare(`
+    INSERT INTO tracked_files (
+      session_key,
+      path,
+      scope,
+      baseline_exists,
+      baseline_size,
+      baseline_mtime_ns,
+      baseline_sha256,
+      baseline_signature,
+      last_seen_exists,
+      last_seen_size,
+      last_seen_mtime_ns,
+      last_seen_sha256,
+      last_seen_signature,
+      last_notified_signature,
+      last_change_at
+    ) VALUES (
+      ?, ?, 'project', 0, '0', '0', '', 'missing',
+      0, '0', '0', '', 'missing', NULL, NULL
+    )
+  `).run(sessionKey, filePath);
+
+  db.prepare(`
+    INSERT INTO alerts (
+      session_key,
+      path,
+      scope,
+      previous_signature,
+      current_signature,
+      created_at
+    ) VALUES (?, ?, 'project', 'missing', 'missing', ?)
+  `).run(sessionKey, filePath, createdAt);
+}
+
+function readSessionRecordCounts(dbPath: string, sessionKey: string): {
+  sessions: number;
+  trackedFiles: number;
+  alerts: number;
+} {
+  const db = new Database(dbPath);
+
+  try {
+    return {
+      sessions: readCount(db, "sessions", sessionKey),
+      trackedFiles: readCount(db, "tracked_files", sessionKey),
+      alerts: readCount(db, "alerts", sessionKey),
+    };
+  } finally {
+    db.close();
+  }
+}
+
+function readCount(
+  db: Database,
+  tableName: "sessions" | "tracked_files" | "alerts",
+  sessionKey: string,
+): number {
+  const row = db
+    .prepare(`SELECT COUNT(*) AS count FROM ${tableName} WHERE session_key = ?`)
+    .get(sessionKey) as { count: number };
+
+  return row.count;
 }

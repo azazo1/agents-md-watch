@@ -72,6 +72,13 @@ bun run print:hooks
 - 同一个 session 对同一个文件签名只提醒一次.
 - 文件再次变化并稳定后, 同一个 session 会收到新的提醒.
 
+## 数据保留
+
+- 默认保留最近 30 天的 session 记录.
+- 过期 session 会连同 `tracked_files` 和 `alerts` 一起清理.
+- 清理发生后会尝试执行 `VACUUM`, 用来回收 SQLite 文件空间.
+- 当前正在运行的 session 不会被本次清理删除.
+
 ## session key
 
 脚本优先从 hook payload 里取这些字段:

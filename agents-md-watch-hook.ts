@@ -83,6 +83,8 @@ interface RunHookResult {
 
 const DEFAULT_MODE: WatchMode = "warn";
 const DEFAULT_STABLE_DELAY_MS = 10_000;
+const DEFAULT_RETENTION_DAYS = 30;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const SESSION_ID_KEYS = [
   "sessionId",
   "session_id",
@@ -135,6 +137,7 @@ export function runHook(
     switch (cliOptions.command) {
       case "session-start":
         startSession(db, session, now);
+        cleanupOldRecords(db, now, session.sessionKey);
         return {
           sessionKey: session.sessionKey,
           alerts: [],
@@ -143,6 +146,7 @@ export function runHook(
       case "pre-tool":
       case "post-tool": {
         ensureSessionRow(db, session, now);
+        cleanupOldRecords(db, now, session.sessionKey);
         const alerts = checkForChanges(db, session, now, stableDelayMs);
         const response = buildHookResponse(
           alerts,
@@ -158,6 +162,7 @@ export function runHook(
       }
       case "stop":
         markSessionStopped(db, session.sessionKey, now);
+        cleanupOldRecords(db, now, session.sessionKey);
         return {
           sessionKey: session.sessionKey,
           alerts: [],
@@ -323,6 +328,9 @@ function ensureSchema(db: Database): void {
       current_signature TEXT NOT NULL,
       created_at TEXT NOT NULL
     );
+
+    CREATE INDEX IF NOT EXISTS alerts_session_key_idx
+      ON alerts (session_key);
   `);
 }
 
@@ -673,6 +681,67 @@ function markSessionStopped(db: Database, sessionKey: string, now: string): void
     SET status = 'stopped', ended_at = ?
     WHERE session_key = ?
   `).run(now, sessionKey);
+}
+
+function cleanupOldRecords(
+  db: Database,
+  now: string,
+  currentSessionKey: string,
+): void {
+  const cutoff = retentionCutoffIso(now);
+
+  if (!cutoff) {
+    return;
+  }
+
+  const oldSessions = db.prepare(`
+    SELECT session_key
+    FROM sessions
+    WHERE session_key != ?
+      AND COALESCE(ended_at, created_at) < ?
+  `).all(currentSessionKey, cutoff) as Array<{ session_key: string }>;
+
+  if (oldSessions.length === 0) {
+    return;
+  }
+
+  const deleteTrackedFiles = db.prepare(
+    "DELETE FROM tracked_files WHERE session_key = ?",
+  );
+  const deleteAlerts = db.prepare(
+    "DELETE FROM alerts WHERE session_key = ?",
+  );
+  const deleteSession = db.prepare(
+    "DELETE FROM sessions WHERE session_key = ?",
+  );
+
+  db.transaction(() => {
+    for (const session of oldSessions) {
+      deleteTrackedFiles.run(session.session_key);
+      deleteAlerts.run(session.session_key);
+      deleteSession.run(session.session_key);
+    }
+  })();
+
+  tryVacuumDatabase(db);
+}
+
+function retentionCutoffIso(now: string): string | null {
+  const nowMs = Date.parse(now);
+
+  if (!Number.isFinite(nowMs)) {
+    return null;
+  }
+
+  return new Date(nowMs - DEFAULT_RETENTION_DAYS * MS_PER_DAY).toISOString();
+}
+
+function tryVacuumDatabase(db: Database): void {
+  try {
+    db.exec("VACUUM");
+  } catch {
+    return;
+  }
 }
 
 function collectSnapshots(session: SessionContext): FileSnapshot[] {
