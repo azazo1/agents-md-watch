@@ -62,8 +62,10 @@ interface TrackedFileRow {
   path: string;
   scope: Scope;
   baseline_signature: string;
+  baseline_content: string | null;
   last_seen_signature: string;
   last_notified_signature: string | null;
+  last_notified_content: string | null;
   last_change_at: string | null;
 }
 
@@ -72,6 +74,7 @@ interface AlertRecord {
   scope: Scope;
   previousSignature: string;
   currentSignature: string;
+  previousContent: string | null | undefined;
   currentContent: string | null;
 }
 
@@ -84,6 +87,9 @@ interface RunHookResult {
 const DEFAULT_MODE: WatchMode = "warn";
 const DEFAULT_STABLE_DELAY_MS = 10_000;
 const DEFAULT_RETENTION_DAYS = 30;
+const DIFF_CONTEXT_LINES = 3;
+const LCS_CELL_LIMIT = 1_500_000;
+const MAX_DIFF_LINES = 400;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 const SESSION_ID_KEYS = [
   "sessionId",
@@ -309,12 +315,15 @@ function ensureSchema(db: Database): void {
       baseline_mtime_ns TEXT NOT NULL,
       baseline_sha256 TEXT NOT NULL,
       baseline_signature TEXT NOT NULL,
+      baseline_content TEXT,
       last_seen_exists INTEGER NOT NULL,
       last_seen_size TEXT NOT NULL,
       last_seen_mtime_ns TEXT NOT NULL,
       last_seen_sha256 TEXT NOT NULL,
       last_seen_signature TEXT NOT NULL,
+      last_seen_content TEXT,
       last_notified_signature TEXT,
+      last_notified_content TEXT,
       last_change_at TEXT,
       PRIMARY KEY (session_key, path)
     );
@@ -332,6 +341,24 @@ function ensureSchema(db: Database): void {
     CREATE INDEX IF NOT EXISTS alerts_session_key_idx
       ON alerts (session_key);
   `);
+  ensureTrackedFilesContentColumns(db);
+}
+
+function ensureTrackedFilesContentColumns(db: Database): void {
+  const columns = db.prepare("PRAGMA table_info(tracked_files)").all() as Array<{
+    name: string;
+  }>;
+  const columnNames = new Set(columns.map((column) => column.name));
+
+  for (const columnName of [
+    "baseline_content",
+    "last_seen_content",
+    "last_notified_content",
+  ]) {
+    if (!columnNames.has(columnName)) {
+      db.exec(`ALTER TABLE tracked_files ADD COLUMN ${columnName} TEXT`);
+    }
+  }
 }
 
 function resolveSessionContext(
@@ -417,15 +444,19 @@ function startSession(db: Database, session: SessionContext, now: string): void 
       baseline_mtime_ns,
       baseline_sha256,
       baseline_signature,
+      baseline_content,
       last_seen_exists,
       last_seen_size,
       last_seen_mtime_ns,
       last_seen_sha256,
       last_seen_signature,
+      last_seen_content,
       last_notified_signature,
+      last_notified_content,
       last_change_at
     ) VALUES (
-      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      NULL,
       NULL,
       NULL
     )
@@ -482,9 +513,11 @@ function checkForChanges(
       path,
       scope,
       baseline_signature,
+      baseline_content,
       last_seen_signature,
       last_change_at,
-      last_notified_signature
+      last_notified_signature,
+      last_notified_content
     FROM tracked_files
     WHERE session_key = ? AND path = ?
   `);
@@ -498,14 +531,17 @@ function checkForChanges(
       baseline_mtime_ns,
       baseline_sha256,
       baseline_signature,
+      baseline_content,
       last_seen_exists,
       last_seen_size,
       last_seen_mtime_ns,
       last_seen_sha256,
       last_seen_signature,
+      last_seen_content,
       last_notified_signature,
+      last_notified_content,
       last_change_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
   `);
   const updateLastSeen = db.prepare(`
     UPDATE tracked_files
@@ -516,6 +552,7 @@ function checkForChanges(
       last_seen_mtime_ns = ?,
       last_seen_sha256 = ?,
       last_seen_signature = ?,
+      last_seen_content = ?,
       last_change_at = ?
     WHERE session_key = ? AND path = ?
   `);
@@ -523,6 +560,7 @@ function checkForChanges(
     UPDATE tracked_files
     SET
       last_notified_signature = ?,
+      last_notified_content = ?,
       last_change_at = NULL
     WHERE session_key = ? AND path = ?
   `);
@@ -546,21 +584,7 @@ function checkForChanges(
       ) as TrackedFileRow | null;
 
       if (!existing) {
-        insertTracked.run(
-          session.sessionKey,
-          snapshot.path,
-          snapshot.scope,
-          snapshot.exists ? 1 : 0,
-          snapshot.size,
-          snapshot.mtimeNs,
-          snapshot.sha256,
-          snapshot.signature,
-          snapshot.exists ? 1 : 0,
-          snapshot.size,
-          snapshot.mtimeNs,
-          snapshot.sha256,
-          snapshot.signature,
-        );
+        insertTracked.run(...trackedInsertValues(session.sessionKey, snapshot));
         continue;
       }
 
@@ -580,6 +604,7 @@ function checkForChanges(
         snapshot.mtimeNs,
         snapshot.sha256,
         snapshot.signature,
+        snapshot.content,
         pendingSince,
         session.sessionKey,
         snapshot.path,
@@ -598,10 +623,12 @@ function checkForChanges(
         scope: existing.scope,
         previousSignature,
         currentSignature: snapshot.signature,
+        previousContent: resolvePreviousContent(existing, previousSignature),
         currentContent: snapshot.content,
       });
       markAlerted.run(
         snapshot.signature,
+        snapshot.content,
         session.sessionKey,
         snapshot.path,
       );
@@ -821,7 +848,7 @@ function snapshotFile(filePath: string, scope: Scope): FileSnapshot {
 function trackedInsertValues(
   sessionKey: string,
   snapshot: FileSnapshot,
-): Array<string | number> {
+): Array<string | number | null> {
   return [
     sessionKey,
     snapshot.path,
@@ -831,12 +858,33 @@ function trackedInsertValues(
     snapshot.mtimeNs,
     snapshot.sha256,
     snapshot.signature,
+    snapshot.content,
     snapshot.exists ? 1 : 0,
     snapshot.size,
     snapshot.mtimeNs,
     snapshot.sha256,
     snapshot.signature,
+    snapshot.content,
   ];
+}
+
+function resolvePreviousContent(
+  existing: TrackedFileRow,
+  previousSignature: string,
+): string | null | undefined {
+  if (previousSignature === "missing") {
+    return null;
+  }
+
+  if (existing.last_notified_signature === previousSignature) {
+    return existing.last_notified_content ?? undefined;
+  }
+
+  if (existing.baseline_signature === previousSignature) {
+    return existing.baseline_content ?? undefined;
+  }
+
+  return undefined;
 }
 
 function buildHookResponse(
@@ -850,21 +898,27 @@ function buildHookResponse(
   }
 
   const lines = alerts.map((alert) => {
-    const relativePath = relative(cwd, alert.path) || alert.path;
-    return `- ${alert.scope} ${relativePath}: ${compactSignature(alert.previousSignature)} -> ${compactSignature(alert.currentSignature)}`;
+    const displayPath = formatAlertPath(alert, cwd);
+    return `- ${alert.scope} ${displayPath}: ${compactSignature(alert.previousSignature)} -> ${compactSignature(alert.currentSignature)}`;
   });
-  const contentLines = alerts.flatMap((alert) => {
-    const relativePath = relative(cwd, alert.path) || alert.path;
-    const content = alert.currentContent ?? "<missing>";
+  const diffLines = alerts.flatMap((alert) => {
+    const displayPath = formatAlertPath(alert, cwd);
 
-    return [`${relativePath} 最新内容:`, "<<<AGENTS.md", content, ">>>"];
+    return [
+      `${displayPath} diff:`,
+      ...buildUnifiedDiff(
+        displayPath,
+        alert.previousContent,
+        alert.currentContent,
+      ),
+    ];
   });
   const hookEventName = mapHookEventName(command);
   const title = "检测到当前 session 的 AGENTS 指令文件发生变化";
   const detail = [
     title,
     ...lines,
-    ...contentLines,
+    ...diffLines,
     "请按最新指令继续后续工作.",
   ].join("\n");
   const response: Record<string, JsonValue> = {
@@ -890,6 +944,333 @@ function buildHookResponse(
   }
 
   return response;
+}
+
+function formatAlertPath(alert: AlertRecord, cwd: string): string {
+  if (alert.scope === "global") {
+    return alert.path;
+  }
+
+  return relative(cwd, alert.path) || alert.path;
+}
+
+type DiffLineKind = "context" | "add" | "remove";
+
+interface NumberedDiffLine {
+  kind: DiffLineKind;
+  text: string;
+  oldLine: number;
+  newLine: number;
+}
+
+function buildUnifiedDiff(
+  fileLabel: string,
+  previousContent: string | null | undefined,
+  currentContent: string | null,
+): string[] {
+  const previousLabel = previousContent === null ? "/dev/null" : `a/${fileLabel}`;
+  const currentLabel = currentContent === null ? "/dev/null" : `b/${fileLabel}`;
+  const header = [`--- ${previousLabel}`, `+++ ${currentLabel}`];
+
+  if (previousContent === undefined) {
+    return [
+      ...header,
+      "@@ content unavailable @@",
+      "previous content was not stored for this existing session",
+    ];
+  }
+
+  const previousLines = previousContent === null ? [] : splitDiffLines(previousContent);
+  const currentLines = currentContent === null ? [] : splitDiffLines(currentContent);
+  const diffLines = buildDiffLines(previousLines, currentLines);
+
+  if (diffLines.every((line) => line.kind === "context")) {
+    const emptyStateChanged = previousContent !== currentContent;
+    const marker = emptyStateChanged
+      ? "@@ empty file state changed @@"
+      : "@@ metadata-only change @@";
+
+    return [...header, marker];
+  }
+
+  return [...header, ...truncateDiffLines(formatDiffHunks(diffLines))];
+}
+
+function splitDiffLines(content: string): string[] {
+  if (content.length === 0) {
+    return [];
+  }
+
+  const normalized = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  const lines = normalized.split("\n");
+
+  if (lines[lines.length - 1] === "") {
+    lines.pop();
+  }
+
+  return lines;
+}
+
+function buildDiffLines(
+  previousLines: string[],
+  currentLines: string[],
+): NumberedDiffLine[] {
+  const cellCount = (previousLines.length + 1) * (currentLines.length + 1);
+
+  if (cellCount > LCS_CELL_LIMIT) {
+    return buildWindowDiffLines(previousLines, currentLines);
+  }
+
+  const lcs = Array.from(
+    { length: previousLines.length + 1 },
+    () => new Uint32Array(currentLines.length + 1),
+  );
+
+  for (let oldIndex = previousLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
+    for (let newIndex = currentLines.length - 1; newIndex >= 0; newIndex -= 1) {
+      if (previousLines[oldIndex] === currentLines[newIndex]) {
+        lcs[oldIndex][newIndex] = lcs[oldIndex + 1][newIndex + 1] + 1;
+      } else {
+        lcs[oldIndex][newIndex] = Math.max(
+          lcs[oldIndex + 1][newIndex],
+          lcs[oldIndex][newIndex + 1],
+        );
+      }
+    }
+  }
+
+  const diffLines: NumberedDiffLine[] = [];
+  let oldIndex = 0;
+  let newIndex = 0;
+  let oldLine = 1;
+  let newLine = 1;
+
+  while (oldIndex < previousLines.length && newIndex < currentLines.length) {
+    if (previousLines[oldIndex] === currentLines[newIndex]) {
+      diffLines.push({
+        kind: "context",
+        text: previousLines[oldIndex],
+        oldLine,
+        newLine,
+      });
+      oldIndex += 1;
+      newIndex += 1;
+      oldLine += 1;
+      newLine += 1;
+      continue;
+    }
+
+    if (lcs[oldIndex + 1][newIndex] >= lcs[oldIndex][newIndex + 1]) {
+      diffLines.push({
+        kind: "remove",
+        text: previousLines[oldIndex],
+        oldLine,
+        newLine: Math.max(0, newLine - 1),
+      });
+      oldIndex += 1;
+      oldLine += 1;
+      continue;
+    }
+
+    diffLines.push({
+      kind: "add",
+      text: currentLines[newIndex],
+      oldLine: Math.max(0, oldLine - 1),
+      newLine,
+    });
+    newIndex += 1;
+    newLine += 1;
+  }
+
+  while (oldIndex < previousLines.length) {
+    diffLines.push({
+      kind: "remove",
+      text: previousLines[oldIndex],
+      oldLine,
+      newLine: Math.max(0, newLine - 1),
+    });
+    oldIndex += 1;
+    oldLine += 1;
+  }
+
+  while (newIndex < currentLines.length) {
+    diffLines.push({
+      kind: "add",
+      text: currentLines[newIndex],
+      oldLine: Math.max(0, oldLine - 1),
+      newLine,
+    });
+    newIndex += 1;
+    newLine += 1;
+  }
+
+  return diffLines;
+}
+
+function buildWindowDiffLines(
+  previousLines: string[],
+  currentLines: string[],
+): NumberedDiffLine[] {
+  let prefixLength = 0;
+
+  while (
+    prefixLength < previousLines.length &&
+    prefixLength < currentLines.length &&
+    previousLines[prefixLength] === currentLines[prefixLength]
+  ) {
+    prefixLength += 1;
+  }
+
+  let suffixLength = 0;
+
+  while (
+    suffixLength < previousLines.length - prefixLength &&
+    suffixLength < currentLines.length - prefixLength &&
+    previousLines[previousLines.length - 1 - suffixLength] ===
+      currentLines[currentLines.length - 1 - suffixLength]
+  ) {
+    suffixLength += 1;
+  }
+
+  const diffLines: NumberedDiffLine[] = [];
+  const contextStart = Math.max(0, prefixLength - DIFF_CONTEXT_LINES);
+
+  for (let index = contextStart; index < prefixLength; index += 1) {
+    diffLines.push({
+      kind: "context",
+      text: previousLines[index],
+      oldLine: index + 1,
+      newLine: index + 1,
+    });
+  }
+
+  for (let index = prefixLength; index < previousLines.length - suffixLength; index += 1) {
+    diffLines.push({
+      kind: "remove",
+      text: previousLines[index],
+      oldLine: index + 1,
+      newLine: Math.max(0, prefixLength),
+    });
+  }
+
+  for (let index = prefixLength; index < currentLines.length - suffixLength; index += 1) {
+    diffLines.push({
+      kind: "add",
+      text: currentLines[index],
+      oldLine: Math.max(0, prefixLength),
+      newLine: index + 1,
+    });
+  }
+
+  const suffixContextLength = Math.min(suffixLength, DIFF_CONTEXT_LINES);
+  const previousSuffixStart = previousLines.length - suffixLength;
+  const currentSuffixStart = currentLines.length - suffixLength;
+
+  for (let offset = 0; offset < suffixContextLength; offset += 1) {
+    diffLines.push({
+      kind: "context",
+      text: previousLines[previousSuffixStart + offset],
+      oldLine: previousSuffixStart + offset + 1,
+      newLine: currentSuffixStart + offset + 1,
+    });
+  }
+
+  return diffLines;
+}
+
+function formatDiffHunks(diffLines: NumberedDiffLine[]): string[] {
+  const hunks: string[] = [];
+  let index = 0;
+
+  while (index < diffLines.length) {
+    while (index < diffLines.length && diffLines[index].kind === "context") {
+      index += 1;
+    }
+
+    if (index >= diffLines.length) {
+      break;
+    }
+
+    const hunkStart = Math.max(0, index - DIFF_CONTEXT_LINES);
+    let scanIndex = index;
+    let lastChangeIndex = index;
+
+    while (scanIndex < diffLines.length) {
+      if (diffLines[scanIndex].kind !== "context") {
+        lastChangeIndex = scanIndex;
+      }
+
+      if (scanIndex - lastChangeIndex > DIFF_CONTEXT_LINES) {
+        break;
+      }
+
+      scanIndex += 1;
+    }
+
+    const hunkEnd = Math.min(
+      diffLines.length,
+      lastChangeIndex + DIFF_CONTEXT_LINES + 1,
+    );
+    const hunkLines = diffLines.slice(hunkStart, hunkEnd);
+
+    hunks.push(formatHunkHeader(hunkLines));
+    hunks.push(...hunkLines.map(formatDiffLine));
+    index = hunkEnd;
+  }
+
+  return hunks;
+}
+
+function formatHunkHeader(hunkLines: NumberedDiffLine[]): string {
+  const oldCount = hunkLines.filter((line) => line.kind !== "add").length;
+  const newCount = hunkLines.filter((line) => line.kind !== "remove").length;
+  const firstOldLine =
+    hunkLines.find((line) => line.kind !== "add")?.oldLine ??
+    hunkLines[0]?.oldLine ??
+    0;
+  const firstNewLine =
+    hunkLines.find((line) => line.kind !== "remove")?.newLine ??
+    hunkLines[0]?.newLine ??
+    0;
+
+  return `@@ -${formatDiffRange(firstOldLine, oldCount)} +${formatDiffRange(firstNewLine, newCount)} @@`;
+}
+
+function formatDiffRange(startLine: number, lineCount: number): string {
+  if (lineCount === 0) {
+    return `${startLine},0`;
+  }
+
+  if (lineCount === 1) {
+    return `${startLine}`;
+  }
+
+  return `${startLine},${lineCount}`;
+}
+
+function formatDiffLine(line: NumberedDiffLine): string {
+  if (line.kind === "add") {
+    return `+${line.text}`;
+  }
+
+  if (line.kind === "remove") {
+    return `-${line.text}`;
+  }
+
+  return ` ${line.text}`;
+}
+
+function truncateDiffLines(lines: string[]): string[] {
+  if (lines.length <= MAX_DIFF_LINES) {
+    return lines;
+  }
+
+  const omittedCount = lines.length - MAX_DIFF_LINES;
+
+  return [
+    ...lines.slice(0, MAX_DIFF_LINES),
+    `... diff truncated, ${omittedCount} lines omitted ...`,
+  ];
 }
 
 function mapHookEventName(command: HookCommand): string {

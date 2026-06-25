@@ -9,7 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 
 import { runHook } from "./agents-md-watch-hook";
 
@@ -93,6 +93,39 @@ describe("agents watch hook", () => {
     expect(second.alerts).toHaveLength(1);
   });
 
+  test("alert response includes diff from last notified content", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-diff", cwd: ctx.cwd };
+
+    ctx.writeAgentsFile(
+      ctx.projectAgentsPath,
+      "# title\nvalue: baseline\nend\n",
+    );
+    runHook({ command: "session-start" }, payload, ctx.options);
+
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# title\nvalue: first\nend\n");
+
+    const first = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const firstMessage = String(first.response.systemMessage);
+
+    expect(firstMessage).toContain("--- a/");
+    expect(firstMessage).toContain("+++ b/");
+    expect(firstMessage).toContain("@@");
+    expect(firstMessage).toContain("-value: baseline");
+    expect(firstMessage).toContain("+value: first");
+    expect(firstMessage).not.toContain("<<<AGENTS.md");
+    expect(firstMessage).not.toContain("最新内容");
+
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# title\nvalue: second\nend\n");
+
+    const second = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const secondMessage = String(second.response.systemMessage);
+
+    expect(secondMessage).toContain("-value: first");
+    expect(secondMessage).toContain("+value: second");
+    expect(secondMessage).not.toContain("-value: baseline");
+  });
+
   test("unstable content changes reset the stable delay", () => {
     const ctx = createFixture();
     const payload = { sessionId: "session-unstable", cwd: ctx.cwd };
@@ -154,6 +187,22 @@ describe("agents watch hook", () => {
     expect(pending.alerts).toHaveLength(0);
     expect(result.alerts).toHaveLength(1);
     expect(result.alerts[0]?.path).toBe(ctx.globalAgentsPath);
+  });
+
+  test("global file alert response keeps an absolute path", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-global-absolute", cwd: ctx.cwd };
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(ctx.globalAgentsPath, "# global changed\n");
+
+    const result = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const message = String(result.response.systemMessage);
+    const relativeGlobalPath = relative(ctx.cwd, ctx.globalAgentsPath);
+
+    expect(message).toContain(`global ${ctx.globalAgentsPath}`);
+    expect(message).toContain(`${ctx.globalAgentsPath} diff:`);
+    expect(message).not.toContain(relativeGlobalPath);
   });
 
   test("strict pre-tool returns a deny decision", () => {
@@ -219,6 +268,68 @@ describe("agents watch hook", () => {
     expect(recentCounts.alerts).toBe(1);
     expect(currentCounts.sessions).toBe(1);
     expect(currentCounts.trackedFiles).toBeGreaterThan(0);
+  });
+
+  test("migrates tracked file content columns for existing databases", () => {
+    const ctx = createFixture();
+    const payload = { sessionId: "session-migrate", cwd: ctx.cwd };
+
+    mkdirSync(dirname(ctx.options.dbPath), { recursive: true });
+    withDatabase(ctx.options.dbPath, (db) => {
+      db.exec(`
+        CREATE TABLE sessions (
+          session_key TEXT PRIMARY KEY,
+          cwd TEXT NOT NULL,
+          project_root TEXT NOT NULL,
+          codex_home TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          ended_at TEXT,
+          status TEXT NOT NULL
+        );
+
+        CREATE TABLE tracked_files (
+          session_key TEXT NOT NULL,
+          path TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          baseline_exists INTEGER NOT NULL,
+          baseline_size TEXT NOT NULL,
+          baseline_mtime_ns TEXT NOT NULL,
+          baseline_sha256 TEXT NOT NULL,
+          baseline_signature TEXT NOT NULL,
+          last_seen_exists INTEGER NOT NULL,
+          last_seen_size TEXT NOT NULL,
+          last_seen_mtime_ns TEXT NOT NULL,
+          last_seen_sha256 TEXT NOT NULL,
+          last_seen_signature TEXT NOT NULL,
+          last_notified_signature TEXT,
+          last_change_at TEXT,
+          PRIMARY KEY (session_key, path)
+        );
+
+        CREATE TABLE alerts (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          session_key TEXT NOT NULL,
+          path TEXT NOT NULL,
+          scope TEXT NOT NULL,
+          previous_signature TEXT NOT NULL,
+          current_signature TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+      `);
+    });
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+
+    withDatabase(ctx.options.dbPath, (db) => {
+      const columns = db.prepare("PRAGMA table_info(tracked_files)").all() as Array<{
+        name: string;
+      }>;
+      const columnNames = columns.map((column) => column.name);
+
+      expect(columnNames).toContain("baseline_content");
+      expect(columnNames).toContain("last_seen_content");
+      expect(columnNames).toContain("last_notified_content");
+    });
   });
 });
 
