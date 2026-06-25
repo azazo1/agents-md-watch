@@ -27,6 +27,7 @@ interface HookCliOptions {
   mode?: WatchMode;
   projectRoot?: string;
   codexHome?: string;
+  stableDelayMs?: number;
 }
 
 interface RunHookOptions {
@@ -34,6 +35,7 @@ interface RunHookOptions {
   mode: WatchMode;
   projectRoot?: string;
   codexHome?: string;
+  stableDelayMs?: number;
   now?: () => string;
 }
 
@@ -52,6 +54,7 @@ interface FileSnapshot {
   mtimeNs: string;
   sha256: string;
   signature: string;
+  content: string | null;
 }
 
 interface TrackedFileRow {
@@ -59,7 +62,9 @@ interface TrackedFileRow {
   path: string;
   scope: Scope;
   baseline_signature: string;
+  last_seen_signature: string;
   last_notified_signature: string | null;
+  last_change_at: string | null;
 }
 
 interface AlertRecord {
@@ -67,6 +72,7 @@ interface AlertRecord {
   scope: Scope;
   previousSignature: string;
   currentSignature: string;
+  currentContent: string | null;
 }
 
 interface RunHookResult {
@@ -76,6 +82,7 @@ interface RunHookResult {
 }
 
 const DEFAULT_MODE: WatchMode = "warn";
+const DEFAULT_STABLE_DELAY_MS = 10_000;
 const SESSION_ID_KEYS = [
   "sessionId",
   "session_id",
@@ -105,6 +112,7 @@ export async function main(argv: string[]): Promise<void> {
     mode: cliOptions.mode ?? DEFAULT_MODE,
     projectRoot: cliOptions.projectRoot,
     codexHome: cliOptions.codexHome,
+    stableDelayMs: cliOptions.stableDelayMs ?? DEFAULT_STABLE_DELAY_MS,
   });
 
   process.stdout.write(`${JSON.stringify(result.response, null, 2)}\n`);
@@ -122,6 +130,7 @@ export function runHook(
 
     const session = resolveSessionContext(payload, options);
     const now = (options.now ?? (() => new Date().toISOString()))();
+    const stableDelayMs = options.stableDelayMs ?? DEFAULT_STABLE_DELAY_MS;
 
     switch (cliOptions.command) {
       case "session-start":
@@ -134,7 +143,7 @@ export function runHook(
       case "pre-tool":
       case "post-tool": {
         ensureSessionRow(db, session, now);
-        const alerts = checkForChanges(db, session, now);
+        const alerts = checkForChanges(db, session, now, stableDelayMs);
         const response = buildHookResponse(
           alerts,
           cliOptions.command,
@@ -172,7 +181,7 @@ function parseCli(argv: string[]): HookCliOptions {
     command !== "stop"
   ) {
     throw new Error(
-      "Usage: bun agents-md-watch-hook.ts <session-start|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH]",
+      "Usage: bun agents-md-watch-hook.ts <session-start|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH] [--stable-delay-seconds SECONDS]",
     );
   }
 
@@ -182,6 +191,9 @@ function parseCli(argv: string[]): HookCliOptions {
     mode: readMode(process.env.CODEX_AGENTS_WATCH_MODE),
     projectRoot: process.env.CODEX_AGENTS_WATCH_PROJECT_ROOT,
     codexHome: process.env.CODEX_HOME,
+    stableDelayMs: readStableDelayMs(
+      process.env.CODEX_AGENTS_WATCH_STABLE_DELAY_SECONDS,
+    ),
   };
 
   for (let index = 3; index < argv.length; index += 1) {
@@ -211,9 +223,29 @@ function parseCli(argv: string[]): HookCliOptions {
       index += 1;
       continue;
     }
+
+    if (flag === "--stable-delay-seconds" && value) {
+      cliOptions.stableDelayMs = readStableDelayMs(value);
+      index += 1;
+      continue;
+    }
   }
 
   return cliOptions;
+}
+
+function readStableDelayMs(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const seconds = Number(value);
+
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    throw new Error(`Unsupported stable delay seconds: ${value}`);
+  }
+
+  return Math.round(seconds * 1000);
 }
 
 function readMode(value: string | undefined): WatchMode | undefined {
@@ -433,6 +465,7 @@ function checkForChanges(
   db: Database,
   session: SessionContext,
   now: string,
+  stableDelayMs: number,
 ): AlertRecord[] {
   const snapshots = collectSnapshots(session);
   const selectTracked = db.prepare(`
@@ -441,6 +474,8 @@ function checkForChanges(
       path,
       scope,
       baseline_signature,
+      last_seen_signature,
+      last_change_at,
       last_notified_signature
     FROM tracked_files
     WHERE session_key = ? AND path = ?
@@ -472,14 +507,15 @@ function checkForChanges(
       last_seen_size = ?,
       last_seen_mtime_ns = ?,
       last_seen_sha256 = ?,
-      last_seen_signature = ?
+      last_seen_signature = ?,
+      last_change_at = ?
     WHERE session_key = ? AND path = ?
   `);
   const markAlerted = db.prepare(`
     UPDATE tracked_files
     SET
       last_notified_signature = ?,
-      last_change_at = ?
+      last_change_at = NULL
     WHERE session_key = ? AND path = ?
   `);
   const insertAlert = db.prepare(`
@@ -522,6 +558,12 @@ function checkForChanges(
 
       const previousSignature =
         existing.last_notified_signature ?? existing.baseline_signature;
+      const pendingSince = resolvePendingSince(
+        existing,
+        snapshot,
+        previousSignature,
+        now,
+      );
 
       updateLastSeen.run(
         snapshot.scope,
@@ -530,6 +572,7 @@ function checkForChanges(
         snapshot.mtimeNs,
         snapshot.sha256,
         snapshot.signature,
+        pendingSince,
         session.sessionKey,
         snapshot.path,
       );
@@ -538,15 +581,19 @@ function checkForChanges(
         continue;
       }
 
+      if (!pendingSince || !hasStableDelayElapsed(pendingSince, now, stableDelayMs)) {
+        continue;
+      }
+
       alerts.push({
         path: snapshot.path,
         scope: existing.scope,
         previousSignature,
         currentSignature: snapshot.signature,
+        currentContent: snapshot.content,
       });
       markAlerted.run(
         snapshot.signature,
-        now,
         session.sessionKey,
         snapshot.path,
       );
@@ -562,6 +609,62 @@ function checkForChanges(
   })();
 
   return alerts;
+}
+
+function resolvePendingSince(
+  existing: TrackedFileRow,
+  currentSnapshot: FileSnapshot,
+  previousSignature: string,
+  now: string,
+): string | null {
+  if (currentSnapshot.signature === previousSignature) {
+    return null;
+  }
+
+  const mtime = snapshotMtimeIso(currentSnapshot);
+
+  if (mtime) {
+    return mtime;
+  }
+
+  if (
+    existing.last_seen_signature === currentSnapshot.signature &&
+    existing.last_change_at
+  ) {
+    return existing.last_change_at;
+  }
+
+  return now;
+}
+
+function snapshotMtimeIso(snapshot: FileSnapshot): string | null {
+  if (!snapshot.exists || snapshot.mtimeNs === "0") {
+    return null;
+  }
+
+  try {
+    const mtimeNs = BigInt(snapshot.mtimeNs);
+    const mtimeMs = mtimeNs / 1_000_000n;
+
+    return new Date(Number(mtimeMs)).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+function hasStableDelayElapsed(
+  pendingSince: string,
+  now: string,
+  stableDelayMs: number,
+): boolean {
+  const pendingMs = Date.parse(pendingSince);
+  const nowMs = Date.parse(now);
+
+  if (!Number.isFinite(pendingMs) || !Number.isFinite(nowMs)) {
+    return false;
+  }
+
+  return nowMs - pendingMs >= stableDelayMs;
 }
 
 function markSessionStopped(db: Database, sessionKey: string, now: string): void {
@@ -623,6 +726,7 @@ function snapshotFile(filePath: string, scope: Scope): FileSnapshot {
       mtimeNs: "0",
       sha256: "",
       signature: "missing",
+      content: null,
     };
   }
 
@@ -641,6 +745,7 @@ function snapshotFile(filePath: string, scope: Scope): FileSnapshot {
     mtimeNs,
     sha256,
     signature: `present:${mtimeNs}:${size}:${sha256}`,
+    content: content.toString("utf8"),
   };
 }
 
@@ -679,9 +784,20 @@ function buildHookResponse(
     const relativePath = relative(cwd, alert.path) || alert.path;
     return `- ${alert.scope} ${relativePath}: ${compactSignature(alert.previousSignature)} -> ${compactSignature(alert.currentSignature)}`;
   });
+  const contentLines = alerts.flatMap((alert) => {
+    const relativePath = relative(cwd, alert.path) || alert.path;
+    const content = alert.currentContent ?? "<missing>";
+
+    return [`${relativePath} 最新内容:`, "<<<AGENTS.md", content, ">>>"];
+  });
   const hookEventName = mapHookEventName(command);
   const title = "检测到当前 session 的 AGENTS 指令文件发生变化";
-  const detail = [title, ...lines, "请按最新指令继续后续工作."].join("\n");
+  const detail = [
+    title,
+    ...lines,
+    ...contentLines,
+    "请按最新指令继续后续工作.",
+  ].join("\n");
   const response: Record<string, JsonValue> = {
     systemMessage: detail,
     hookSpecificOutput: {

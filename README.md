@@ -5,7 +5,7 @@
 它解决两个问题:
 
 - 数据库存储可以共享, 但观察状态按 session 隔离.
-- agent 工作途中通过 `PreToolUse` 和 `PostToolUse` 检查 `AGENTS.md` 是否变化.
+- agent 工作途中通过 `PreToolUse` 和 `PostToolUse` 检查 `AGENTS.md` 是否变化, 并在变化稳定后提醒.
 
 ## 仓库文件
 
@@ -31,6 +31,7 @@ bun run install:self
 - 复制脚本到 `~/.codex/agents-md-watch`
 - 生成 `~/.codex/state/agents-md-watch.sqlite3`
 - 合并或创建 `~/.codex/hooks.json`
+- 重复安装时会替换旧的 agents-md-watch hook, 其他 hook 会保留
 
 如果你只想看要写入的 hooks 配置:
 
@@ -48,13 +49,15 @@ bun run print:hooks
 `pre-tool`
 
 - agent 每次准备调用工具前检查快照.
-- `warn` 模式下返回提醒.
+- `warn` 模式下在变化稳定后返回提醒.
+- 提醒内容会包含新的 AGENTS 文件全文.
 - `strict` 模式下返回 `permissionDecision: deny`.
 
 `post-tool`
 
 - agent 每次工具执行后再次检查.
-- `warn` 模式下返回提醒.
+- `warn` 模式下在变化稳定后返回提醒.
+- 提醒内容会包含新的 AGENTS 文件全文.
 - `strict` 模式下返回 `continue: false`.
 
 `stop`
@@ -67,7 +70,7 @@ bun run print:hooks
 
 - session A 收到过一次提醒, 不会压掉 session B 的提醒.
 - 同一个 session 对同一个文件签名只提醒一次.
-- 文件再次变化时, 同一个 session 会收到新的提醒.
+- 文件再次变化并稳定后, 同一个 session 会收到新的提醒.
 
 ## session key
 
@@ -93,6 +96,7 @@ bun run print:hooks
 - `--target-dir`: 默认 `~/.codex/agents-md-watch`
 - `--db-path`: 默认 `~/.codex/state/agents-md-watch.sqlite3`
 - `--mode`: `warn` 或 `strict`
+- `--stable-delay-seconds`: 默认 `10`
 - `--hooks-json`: 默认 `~/.codex/hooks.json`
 - `--print-only`: 只打印配置, 不写文件
 
@@ -102,7 +106,8 @@ bun run print:hooks
 bun ./install.ts \
   --target-dir ~/.codex/agents-md-watch \
   --db-path ~/.codex/state/agents-md-watch.sqlite3 \
-  --mode warn
+  --mode warn \
+  --stable-delay-seconds 10
 ```
 
 ## 卸载
@@ -133,6 +138,7 @@ bun test
 
 - 每个 session 独立去重.
 - 同一个签名不会重复提醒.
-- 文件再次变化会再次提醒.
+- 文件再次变化并稳定后会再次提醒.
+- 稳定等待时间可以自定义.
 - 启动时不存在的 AGENTS 文件, 后续创建后也会提醒.
 - 严格模式下的 `PreToolUse` 和 `PostToolUse` 返回格式.

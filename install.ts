@@ -48,6 +48,10 @@ const parsed = parseArgs({
       type: "string",
       default: "warn",
     },
+    "stable-delay-seconds": {
+      type: "string",
+      default: "10",
+    },
     "hooks-json": {
       type: "string",
       default: "~/.codex/hooks.json",
@@ -61,6 +65,9 @@ const parsed = parseArgs({
 });
 
 const mode = readMode(parsed.values.mode);
+const stableDelaySeconds = readStableDelaySeconds(
+  parsed.values["stable-delay-seconds"],
+);
 const repoRoot = dirname(fileURLToPath(import.meta.url));
 const targetDir = expandHome(parsed.values["target-dir"]);
 const dbPath = expandHome(parsed.values["db-path"]);
@@ -69,6 +76,7 @@ const generatedHooks = buildHooksConfig(
   join(targetDir, "agents-md-watch-hook.ts"),
   dbPath,
   mode,
+  stableDelaySeconds,
 );
 
 if (parsed.values["print-only"]) {
@@ -91,6 +99,7 @@ const summary = [
   `已安装到: ${targetDir}`,
   `数据库路径: ${dbPath}`,
   `模式: ${mode}`,
+  `稳定等待: ${stableDelaySeconds}s`,
   `hooks.json: ${hooksMergeResult}`,
   `生成的 hooks 示例: ${generatedHooksPath}`,
 ];
@@ -103,6 +112,16 @@ function readMode(value: string): WatchMode {
   }
 
   throw new Error(`Unsupported mode: ${value}`);
+}
+
+function readStableDelaySeconds(value: string): number {
+  const seconds = Number(value);
+
+  if (!Number.isFinite(seconds) || seconds < 0) {
+    throw new Error(`Unsupported stable delay seconds: ${value}`);
+  }
+
+  return seconds;
 }
 
 function expandHome(pathText: string): string {
@@ -121,9 +140,10 @@ function buildHooksConfig(
   installedHookPath: string,
   dbPath: string,
   mode: WatchMode,
+  stableDelaySeconds: number,
 ): HooksFile {
   const renderCommand = (eventCommand: string) =>
-    `bun ${shellQuote(installedHookPath)} ${eventCommand} --db-path ${shellQuote(dbPath)} --mode ${mode}`;
+    `bun ${shellQuote(installedHookPath)} ${eventCommand} --db-path ${shellQuote(dbPath)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
 
   return {
     hooks: {
@@ -201,19 +221,15 @@ function mergeHooksJson(hooksJsonPath: string, incoming: HooksFile): string {
   }
 
   for (const [eventName, matcherConfigs] of Object.entries(incoming.hooks)) {
-    const targetList = existing.hooks[eventName] ?? [];
+    const targetList = (existing.hooks[eventName] ?? [])
+      .map((entry) => ({
+        ...entry,
+        hooks: entry.hooks.filter((hook) => !isAgentsWatchHook(hook)),
+      }))
+      .filter((entry) => entry.hooks.length > 0);
 
     for (const matcherConfig of matcherConfigs) {
-      const commandSet = new Set(
-        targetList.flatMap((entry) => entry.hooks.map((hook) => hook.command)),
-      );
-      const alreadyPresent = matcherConfig.hooks.every((hook) =>
-        commandSet.has(hook.command),
-      );
-
-      if (!alreadyPresent) {
-        targetList.push(matcherConfig);
-      }
+      targetList.push(matcherConfig);
     }
 
     existing.hooks[eventName] = targetList;
@@ -221,6 +237,10 @@ function mergeHooksJson(hooksJsonPath: string, incoming: HooksFile): string {
 
   writeFileSync(hooksJsonPath, `${JSON.stringify(existing, null, 2)}\n`);
   return hadExistingFile ? `merged into ${hooksJsonPath}` : `created ${hooksJsonPath}`;
+}
+
+function isAgentsWatchHook(hook: HookCommandConfig): boolean {
+  return hook.command.includes("agents-md-watch-hook.ts");
 }
 
 function shellQuote(value: string): string {
