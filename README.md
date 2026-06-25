@@ -105,6 +105,16 @@ bun ./install.ts \
   --mode warn
 ```
 
+## 卸载
+
+当前没有单独的卸载脚本, 按下面 3 步手动清理即可:
+
+1. 删除安装目录 `~/.codex/agents-md-watch`.
+2. 删除数据库文件 `~/.codex/state/agents-md-watch.sqlite3`.
+3. 打开 `~/.codex/hooks.json`, 删除 command 指向 `agents-md-watch-hook.ts` 的 `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop` hooks.
+
+如果这份 `hooks.json` 只给这个项目使用, 也可以在确认没有其他自定义 hooks 后直接删除整个文件.
+
 ## 开发命令
 
 ```bash
