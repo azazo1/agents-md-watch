@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { runHook } from "./agents-watch-hook";
+import { runHook } from "./agents-md-watch-hook";
 
 const testRoots: string[] = [];
 
@@ -110,7 +110,7 @@ function createFixture(options?: {
   createGlobalAgents?: boolean;
   mode?: "warn" | "strict";
 }) {
-  const root = mkdtempSync(join(tmpdir(), "agents-watch-"));
+  const root = mkdtempSync(join(tmpdir(), "agents-md-watch-"));
   testRoots.push(root);
 
   const codexHome = join(root, "codex-home");
@@ -118,7 +118,7 @@ function createFixture(options?: {
   const cwd = join(projectRoot, "src", "nested");
   const globalAgentsPath = join(codexHome, "AGENTS.md");
   const projectAgentsPath = join(projectRoot, "AGENTS.md");
-  const dbPath = join(root, "state", "agents-watch.sqlite3");
+  const dbPath = join(root, "state", "agents-md-watch.sqlite3");
 
   mkdirSync(join(projectRoot, ".git"), { recursive: true });
   mkdirSync(cwd, { recursive: true });

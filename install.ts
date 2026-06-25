@@ -25,8 +25,8 @@ interface HooksFile {
 }
 
 const SCRIPT_FILES = [
-  "agents-watch-hook.ts",
-  "agents-watch-hook.test.ts",
+  "agents-md-watch-hook.ts",
+  "agents-md-watch-hook.test.ts",
   "README.md",
   "package.json",
   "justfile",
@@ -66,7 +66,7 @@ const targetDir = expandHome(parsed.values["target-dir"]);
 const dbPath = expandHome(parsed.values["db-path"]);
 const hooksJsonPath = expandHome(parsed.values["hooks-json"]);
 const generatedHooks = buildHooksConfig(
-  join(targetDir, "agents-watch-hook.ts"),
+  join(targetDir, "agents-md-watch-hook.ts"),
   dbPath,
   mode,
 );

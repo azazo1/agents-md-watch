@@ -172,7 +172,7 @@ function parseCli(argv: string[]): HookCliOptions {
     command !== "stop"
   ) {
     throw new Error(
-      "Usage: bun agents-watch-hook.ts <session-start|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH]",
+      "Usage: bun agents-md-watch-hook.ts <session-start|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH]",
     );
   }
 
@@ -741,7 +741,7 @@ function defaultCodexHome(): string {
 }
 
 function defaultDbPath(): string {
-  return join(defaultCodexHome(), "state", "agents-watch.sqlite3");
+  return join(defaultCodexHome(), "state", "agents-md-watch.sqlite3");
 }
 
 function digestText(value: string): string {

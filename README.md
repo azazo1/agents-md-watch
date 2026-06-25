@@ -9,9 +9,9 @@
 
 ## 仓库文件
 
-- `agents-watch-hook.ts`: 核心 hook 脚本.
+- `agents-md-watch-hook.ts`: 核心 hook 脚本.
 - `install.ts`: 安装脚本, 会复制文件并合并 `~/.codex/hooks.json`.
-- `agents-watch-hook.test.ts`: 关键行为测试.
+- `agents-md-watch-hook.test.ts`: 关键行为测试.
 - `justfile`: 常用命令.
 
 ## 分发方式
