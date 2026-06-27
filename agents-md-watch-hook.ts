@@ -3,9 +3,14 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-type HookCommand = "session-start" | "pre-tool" | "post-tool" | "stop";
+type HookCommand =
+  | "session-start"
+  | "user-prompt"
+  | "pre-tool"
+  | "post-tool"
+  | "stop";
 type WatchMode = "warn" | "strict";
 type Scope = "global" | "project";
 
@@ -46,6 +51,13 @@ interface SessionContext {
   codexHome: string;
 }
 
+interface SessionRow {
+  session_key: string;
+  cwd: string;
+  project_root: string;
+  codex_home: string;
+}
+
 interface FileSnapshot {
   path: string;
   scope: Scope;
@@ -64,6 +76,26 @@ interface TrackedFileRow {
   baseline_signature: string;
   baseline_content: string | null;
   last_seen_signature: string;
+  last_notified_signature: string | null;
+  last_notified_content: string | null;
+  last_change_at: string | null;
+}
+
+interface InheritedTrackedFileRow {
+  path: string;
+  scope: Scope;
+  baseline_exists: number;
+  baseline_size: string;
+  baseline_mtime_ns: string;
+  baseline_sha256: string;
+  baseline_signature: string;
+  baseline_content: string | null;
+  last_seen_exists: number;
+  last_seen_size: string;
+  last_seen_mtime_ns: string;
+  last_seen_sha256: string;
+  last_seen_signature: string;
+  last_seen_content: string | null;
   last_notified_signature: string | null;
   last_notified_content: string | null;
   last_change_at: string | null;
@@ -110,6 +142,44 @@ const TRANSCRIPT_KEYS = [
   "logPath",
   "log_path",
 ];
+const PARENT_SESSION_ID_KEYS = [
+  "parentSessionId",
+  "parent_session_id",
+  "parentThreadId",
+  "parent_thread_id",
+  "sourceSessionId",
+  "source_session_id",
+  "sourceThreadId",
+  "source_thread_id",
+  "forkedFromSessionId",
+  "forked_from_session_id",
+  "forkedFromThreadId",
+  "forked_from_thread_id",
+  "forkSourceSessionId",
+  "fork_source_session_id",
+  "forkSourceThreadId",
+  "fork_source_thread_id",
+  "originalSessionId",
+  "original_session_id",
+  "originalThreadId",
+  "original_thread_id",
+];
+const PARENT_CONTAINER_KEYS = [
+  "parent",
+  "source",
+  "fork",
+  "forkedFrom",
+  "forked_from",
+  "sourceSession",
+  "source_session",
+  "sourceThread",
+  "source_thread",
+  "parentSession",
+  "parent_session",
+  "parentThread",
+  "parent_thread",
+];
+const PARENT_CONTAINER_ID_KEYS = ["id", ...SESSION_ID_KEYS];
 
 export async function main(argv: string[]): Promise<void> {
   const cliOptions = parseCli(argv);
@@ -142,13 +212,19 @@ export function runHook(
 
     switch (cliOptions.command) {
       case "session-start":
-        startSession(db, session, now);
+        startSession(
+          db,
+          session,
+          now,
+          resolveParentSessionKey(payload, session.sessionKey),
+        );
         cleanupOldRecords(db, now, session.sessionKey);
         return {
           sessionKey: session.sessionKey,
           alerts: [],
           response: {},
         };
+      case "user-prompt":
       case "pre-tool":
       case "post-tool": {
         ensureSessionRow(db, session, now);
@@ -187,12 +263,13 @@ function parseCli(argv: string[]): HookCliOptions {
 
   if (
     command !== "session-start" &&
+    command !== "user-prompt" &&
     command !== "pre-tool" &&
     command !== "post-tool" &&
     command !== "stop"
   ) {
     throw new Error(
-      "Usage: bun agents-md-watch-hook.ts <session-start|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH] [--stable-delay-seconds SECONDS]",
+      "Usage: bun agents-md-watch-hook.ts <session-start|user-prompt|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH] [--stable-delay-seconds SECONDS]",
     );
   }
 
@@ -412,6 +489,29 @@ function resolveSessionKey(payload: HookPayload, cwd: string): string {
   return `synthetic-${digestText(fallbackSeed).slice(0, 24)}`;
 }
 
+function resolveParentSessionKey(
+  payload: HookPayload,
+  sessionKey: string,
+): string | undefined {
+  const explicit = findFirstString(payload, PARENT_SESSION_ID_KEYS);
+
+  if (explicit && explicit !== sessionKey) {
+    return explicit;
+  }
+
+  const nested = findFirstStringInsideContainers(
+    payload,
+    PARENT_CONTAINER_KEYS,
+    PARENT_CONTAINER_ID_KEYS,
+  );
+
+  if (nested && nested !== sessionKey) {
+    return nested;
+  }
+
+  return undefined;
+}
+
 function detectProjectRoot(cwd: string): string {
   let current = resolve(cwd);
 
@@ -430,12 +530,270 @@ function detectProjectRoot(cwd: string): string {
   }
 }
 
-function startSession(db: Database, session: SessionContext, now: string): void {
+function startSession(
+  db: Database,
+  session: SessionContext,
+  now: string,
+  parentSessionKey?: string,
+): void {
   ensureSessionRow(db, session, now);
+
+  if (
+    parentSessionKey &&
+    !hasTrackedFiles(db, session.sessionKey) &&
+    inheritTrackedFiles(db, parentSessionKey, session)
+  ) {
+    seedMissingTrackedFiles(db, session);
+    return;
+  }
+
+  seedSessionBaseline(db, session);
+}
+
+function seedSessionBaseline(db: Database, session: SessionContext): void {
   const snapshots = collectSnapshots(session);
 
   const insertFile = db.prepare(`
     INSERT OR REPLACE INTO tracked_files (
+      session_key,
+      path,
+      scope,
+      baseline_exists,
+      baseline_size,
+      baseline_mtime_ns,
+      baseline_sha256,
+      baseline_signature,
+      baseline_content,
+      last_seen_exists,
+      last_seen_size,
+      last_seen_mtime_ns,
+      last_seen_sha256,
+      last_seen_signature,
+      last_seen_content,
+      last_notified_signature,
+      last_notified_content,
+      last_change_at
+    ) VALUES (
+      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+      NULL,
+      NULL,
+      NULL
+    )
+  `);
+
+  db.transaction(() => {
+    for (const snapshot of snapshots) {
+      insertFile.run(...trackedInsertValues(session.sessionKey, snapshot));
+    }
+  })();
+}
+
+function hasTrackedFiles(db: Database, sessionKey: string): boolean {
+  const row = db
+    .prepare("SELECT 1 AS found FROM tracked_files WHERE session_key = ? LIMIT 1")
+    .get(sessionKey) as { found: number } | null;
+
+  return row !== null;
+}
+
+function inheritTrackedFiles(
+  db: Database,
+  parentSessionKey: string,
+  session: SessionContext,
+): boolean {
+  const parentSession = db
+    .prepare(
+      "SELECT session_key, cwd, project_root, codex_home FROM sessions WHERE session_key = ?",
+    )
+    .get(parentSessionKey) as SessionRow | null;
+
+  if (!parentSession) {
+    return false;
+  }
+
+  const rows = db.prepare(`
+    SELECT
+      path,
+      scope,
+      baseline_exists,
+      baseline_size,
+      baseline_mtime_ns,
+      baseline_sha256,
+      baseline_signature,
+      baseline_content,
+      last_seen_exists,
+      last_seen_size,
+      last_seen_mtime_ns,
+      last_seen_sha256,
+      last_seen_signature,
+      last_seen_content,
+      last_notified_signature,
+      last_notified_content,
+      last_change_at
+    FROM tracked_files
+    WHERE session_key = ?
+  `).all(parentSessionKey) as InheritedTrackedFileRow[];
+
+  if (rows.length === 0) {
+    return false;
+  }
+
+  const snapshots = new Map(
+    collectSnapshots(session).map((snapshot) => [snapshot.path, snapshot]),
+  );
+  const insertInherited = db.prepare(`
+    INSERT OR REPLACE INTO tracked_files (
+      session_key,
+      path,
+      scope,
+      baseline_exists,
+      baseline_size,
+      baseline_mtime_ns,
+      baseline_sha256,
+      baseline_signature,
+      baseline_content,
+      last_seen_exists,
+      last_seen_size,
+      last_seen_mtime_ns,
+      last_seen_sha256,
+      last_seen_signature,
+      last_seen_content,
+      last_notified_signature,
+      last_notified_content,
+      last_change_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+
+  db.transaction(() => {
+    for (const row of rows) {
+      const mappedPath = mapInheritedPath(row, parentSession, session);
+      const snapshot = snapshots.get(mappedPath);
+      const baseline = remapSnapshotState(
+        {
+          exists: row.baseline_exists,
+          size: row.baseline_size,
+          mtimeNs: row.baseline_mtime_ns,
+          sha256: row.baseline_sha256,
+          signature: row.baseline_signature,
+          content: row.baseline_content,
+        },
+        snapshot,
+      );
+      const lastSeen = remapSnapshotState(
+        {
+          exists: row.last_seen_exists,
+          size: row.last_seen_size,
+          mtimeNs: row.last_seen_mtime_ns,
+          sha256: row.last_seen_sha256,
+          signature: row.last_seen_signature,
+          content: row.last_seen_content,
+        },
+        snapshot,
+      );
+      const lastNotifiedSignature =
+        row.last_notified_signature && contentMatchesSnapshot(
+          row.last_notified_content,
+          snapshot,
+        )
+          ? snapshot.signature
+          : row.last_notified_signature;
+
+      insertInherited.run(
+        session.sessionKey,
+        mappedPath,
+        row.scope,
+        baseline.exists,
+        baseline.size,
+        baseline.mtimeNs,
+        baseline.sha256,
+        baseline.signature,
+        baseline.content,
+        lastSeen.exists,
+        lastSeen.size,
+        lastSeen.mtimeNs,
+        lastSeen.sha256,
+        lastSeen.signature,
+        lastSeen.content,
+        lastNotifiedSignature,
+        row.last_notified_content,
+        row.last_change_at,
+      );
+    }
+  })();
+
+  return true;
+}
+
+function mapInheritedPath(
+  row: InheritedTrackedFileRow,
+  parentSession: SessionRow,
+  session: SessionContext,
+): string {
+  const parentRoot =
+    row.scope === "global"
+      ? parentSession.codex_home
+      : parentSession.project_root;
+  const currentRoot =
+    row.scope === "global"
+      ? session.codexHome
+      : session.projectRoot;
+  const pathFromRoot = relative(parentRoot, row.path);
+
+  if (
+    pathFromRoot &&
+    pathFromRoot !== ".." &&
+    !pathFromRoot.startsWith(`..${"/"}`) &&
+    !isAbsolute(pathFromRoot)
+  ) {
+    return resolve(currentRoot, pathFromRoot);
+  }
+
+  return row.path;
+}
+
+function remapSnapshotState(
+  state: {
+    exists: number;
+    size: string;
+    mtimeNs: string;
+    sha256: string;
+    signature: string;
+    content: string | null;
+  },
+  snapshot: FileSnapshot | undefined,
+): {
+  exists: number;
+  size: string;
+  mtimeNs: string;
+  sha256: string;
+  signature: string;
+  content: string | null;
+} {
+  if (!contentMatchesSnapshot(state.content, snapshot)) {
+    return state;
+  }
+
+  return {
+    exists: snapshot.exists ? 1 : 0,
+    size: snapshot.size,
+    mtimeNs: snapshot.mtimeNs,
+    sha256: snapshot.sha256,
+    signature: snapshot.signature,
+    content: snapshot.content,
+  };
+}
+
+function contentMatchesSnapshot(
+  content: string | null,
+  snapshot: FileSnapshot | undefined,
+): snapshot is FileSnapshot {
+  return snapshot !== undefined && content === snapshot.content;
+}
+
+function seedMissingTrackedFiles(db: Database, session: SessionContext): void {
+  const snapshots = collectSnapshots(session);
+  const insertFile = db.prepare(`
+    INSERT OR IGNORE INTO tracked_files (
       session_key,
       path,
       scope,
@@ -656,17 +1014,17 @@ function resolvePendingSince(
     return null;
   }
 
-  const mtime = snapshotMtimeIso(currentSnapshot);
-
-  if (mtime) {
-    return mtime;
-  }
-
   if (
     existing.last_seen_signature === currentSnapshot.signature &&
     existing.last_change_at
   ) {
     return existing.last_change_at;
+  }
+
+  const mtime = snapshotMtimeIso(currentSnapshot);
+
+  if (mtime) {
+    return mtime;
   }
 
   return now;
@@ -930,7 +1288,7 @@ function buildHookResponse(
   };
 
   if (mode === "strict") {
-    if (command === "pre-tool") {
+    if (command === "pre-tool" || command === "user-prompt") {
       response.hookSpecificOutput = {
         hookEventName,
         additionalContext: detail,
@@ -1277,6 +1635,8 @@ function mapHookEventName(command: HookCommand): string {
   switch (command) {
     case "session-start":
       return "SessionStart";
+    case "user-prompt":
+      return "UserPromptSubmit";
     case "pre-tool":
       return "PreToolUse";
     case "post-tool":
@@ -1352,6 +1712,43 @@ function findFirstString(
 
   for (const nestedValue of Object.values(value)) {
     const found = findFirstString(nestedValue, keys);
+
+    if (found) {
+      return found;
+    }
+  }
+
+  return undefined;
+}
+
+function findFirstStringInsideContainers(
+  value: JsonValue | HookPayload,
+  containerKeys: string[],
+  keys: string[],
+): string | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
+  for (const containerKey of containerKeys) {
+    const container = value[containerKey];
+    const found = findFirstString(container, keys);
+
+    if (found) {
+      return found;
+    }
+  }
+
+  for (const nestedValue of Object.values(value)) {
+    const found = findFirstStringInsideContainers(
+      nestedValue,
+      containerKeys,
+      keys,
+    );
 
     if (found) {
       return found;

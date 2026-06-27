@@ -5,7 +5,8 @@
 它解决两个问题:
 
 - 数据库存储可以共享, 但观察状态按 session 隔离.
-- agent 工作途中通过 `PreToolUse` 和 `PostToolUse` 检查 `AGENTS.md` 是否变化, 并在变化稳定后提醒.
+- fork 出来的 session 会继承父 session 的观察状态.
+- agent 工作途中通过 `UserPromptSubmit`, `PreToolUse` 和 `PostToolUse` 检查 `AGENTS.md` 是否变化, 并在变化稳定后提醒.
 
 ## 仓库文件
 
@@ -45,6 +46,14 @@ bun run print:hooks
 
 - 为当前 session 建立基线.
 - 记录全局层和项目层的 `AGENTS.md` / `AGENTS.override.md` 快照.
+- 如果 hook payload 带有父 session / 父 thread 标识, 且数据库中存在父 session 的观察记录, fork session 会继承父 session 的观察状态.
+
+`user-prompt`
+
+- 用户提交新提问时检查快照.
+- `warn` 模式下在变化稳定后返回提醒.
+- 提醒内容会包含 AGENTS 文件的 unified diff.
+- `strict` 模式下返回 `permissionDecision: deny`.
 
 `pre-tool`
 
@@ -71,6 +80,7 @@ bun run print:hooks
 - session A 收到过一次提醒, 不会压掉 session B 的提醒.
 - 同一个 session 对同一个文件签名只提醒一次.
 - 文件再次变化并稳定后, 同一个 session 会收到新的提醒.
+- fork session 如果识别到父 session, 会继承父 session 已提醒或待稳定的观察状态.
 
 ## 数据库结构
 
@@ -165,7 +175,7 @@ bun ./install.ts \
 
 1. 删除安装目录 `~/.codex/agents-md-watch`.
 2. 删除数据库文件 `~/.codex/state/agents-md-watch.sqlite3`.
-3. 打开 `~/.codex/hooks.json`, 删除 command 指向 `agents-md-watch-hook.ts` 的 `SessionStart`, `PreToolUse`, `PostToolUse`, `Stop` hooks.
+3. 打开 `~/.codex/hooks.json`, 删除 command 指向 `agents-md-watch-hook.ts` 的 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` hooks.
 
 如果这份 `hooks.json` 只给这个项目使用, 也可以在确认没有其他自定义 hooks 后直接删除整个文件.
 
@@ -186,8 +196,10 @@ bun test
 当前测试覆盖了最关键的几件事:
 
 - 每个 session 独立去重.
+- fork session 继承父 session 的观察状态.
 - 同一个签名不会重复提醒.
 - 文件再次变化并稳定后会再次提醒.
+- 用户提问时会检查 AGENTS 文件变化.
 - 稳定等待时间可以自定义.
 - 启动时不存在的 AGENTS 文件, 后续创建后也会提醒.
 - 严格模式下的 `PreToolUse` 和 `PostToolUse` 返回格式.

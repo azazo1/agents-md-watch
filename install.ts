@@ -173,6 +173,18 @@ function buildHooksConfig(
           ],
         },
       ],
+      UserPromptSubmit: [
+        {
+          hooks: [
+            {
+              type: "command",
+              command: renderCommand("user-prompt"),
+              timeout: 10,
+              statusMessage: "Checking AGENTS changes",
+            },
+          ],
+        },
+      ],
       PostToolUse: [
         {
           matcher: ".*",

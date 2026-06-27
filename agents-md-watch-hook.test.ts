@@ -71,6 +71,84 @@ describe("agents watch hook", () => {
     expect(second.alerts).toHaveLength(0);
   });
 
+  test("forked sessions inherit notified watch state", () => {
+    const ctx = createFixture();
+    const parentPayload = { sessionId: "parent-session", cwd: ctx.cwd };
+    const forkPayload = {
+      sessionId: "fork-session",
+      parentSessionId: "parent-session",
+      cwd: ctx.cwd,
+    };
+
+    runHook({ command: "session-start" }, parentPayload, ctx.options);
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed once\n");
+
+    runHook({ command: "pre-tool" }, parentPayload, ctx.options);
+    ctx.advanceSeconds(10);
+    const parentAlert = runHook(
+      { command: "pre-tool" },
+      parentPayload,
+      ctx.options,
+    );
+
+    runHook({ command: "session-start" }, forkPayload, ctx.options);
+    const forkAlert = runHook({ command: "pre-tool" }, forkPayload, ctx.options);
+
+    expect(parentAlert.alerts).toHaveLength(1);
+    expect(forkAlert.alerts).toHaveLength(0);
+  });
+
+  test("forked sessions inherit pending watch state", () => {
+    const ctx = createFixture();
+    const parentPayload = { sessionId: "pending-parent", cwd: ctx.cwd };
+    const forkPayload = {
+      sessionId: "pending-fork",
+      sourceThread: {
+        id: "pending-parent",
+      },
+      cwd: ctx.cwd,
+    };
+
+    runHook({ command: "session-start" }, parentPayload, ctx.options);
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed once\n");
+    runHook({ command: "pre-tool" }, parentPayload, ctx.options);
+
+    runHook({ command: "session-start" }, forkPayload, ctx.options);
+    ctx.advanceSeconds(10);
+
+    const forkAlert = runHook({ command: "pre-tool" }, forkPayload, ctx.options);
+
+    expect(forkAlert.alerts).toHaveLength(1);
+  });
+
+  test("forked sessions remap project paths into the new project root", () => {
+    const parentCtx = createFixture();
+    const forkCtx = createFixture({ dbPath: parentCtx.options.dbPath });
+    const parentPayload = { sessionId: "path-parent", cwd: parentCtx.cwd };
+    const forkPayload = {
+      sessionId: "path-fork",
+      parentThreadId: "path-parent",
+      cwd: forkCtx.cwd,
+    };
+
+    runHook({ command: "session-start" }, parentPayload, parentCtx.options);
+    parentCtx.writeAgentsFile(parentCtx.projectAgentsPath, "# changed once\n");
+    forkCtx.writeAgentsFile(forkCtx.projectAgentsPath, "# changed once\n");
+
+    runHook({ command: "pre-tool" }, parentPayload, parentCtx.options);
+    parentCtx.advanceSeconds(10);
+    runHook({ command: "pre-tool" }, parentPayload, parentCtx.options);
+
+    runHook({ command: "session-start" }, forkPayload, forkCtx.options);
+    const forkAlert = runHook(
+      { command: "pre-tool" },
+      forkPayload,
+      forkCtx.options,
+    );
+
+    expect(forkAlert.alerts).toHaveLength(0);
+  });
+
   test("later content changes trigger a fresh alert", () => {
     const ctx = createFixture();
     const payload = { sessionId: "session-repeat", cwd: ctx.cwd };
@@ -220,6 +298,23 @@ describe("agents watch hook", () => {
 
     expect(hookOutput.hookEventName).toBe("PreToolUse");
     expect(hookOutput.permissionDecision).toBe("deny");
+  });
+
+  test("user prompt checks agents changes before answering", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-user-prompt", cwd: ctx.cwd };
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed before prompt\n");
+
+    const result = runHook({ command: "user-prompt" }, payload, ctx.options);
+    const hookOutput = result.response.hookSpecificOutput as Record<string, string>;
+
+    expect(result.alerts).toHaveLength(1);
+    expect(hookOutput.hookEventName).toBe("UserPromptSubmit");
+    expect(String(result.response.systemMessage)).toContain(
+      "检测到当前 session 的 AGENTS 指令文件发生变化",
+    );
   });
 
   test("strict post-tool stops the run", () => {
@@ -400,15 +495,21 @@ describe("agents watch installer", () => {
     const agentsCommands = preToolCommands.filter((command) =>
       command.includes("agents-md-watch-hook.ts"),
     );
+    const userPromptCommands = installed.hooks.UserPromptSubmit.flatMap((entry) =>
+      entry.hooks.map((hook) => hook.command),
+    );
 
     expect(preToolCommands).toContain(keepCommand);
     expect(agentsCommands).toHaveLength(1);
     expect(agentsCommands[0]).toContain("--stable-delay-seconds 4");
+    expect(userPromptCommands).toHaveLength(1);
+    expect(userPromptCommands[0]).toContain("user-prompt");
   });
 });
 
 function createFixture(options?: {
   createGlobalAgents?: boolean;
+  dbPath?: string;
   mode?: "warn" | "strict";
   stableDelayMs?: number;
 }) {
@@ -420,7 +521,7 @@ function createFixture(options?: {
   const cwd = join(projectRoot, "src", "nested");
   const globalAgentsPath = join(codexHome, "AGENTS.md");
   const projectAgentsPath = join(projectRoot, "AGENTS.md");
-  const dbPath = join(root, "state", "agents-md-watch.sqlite3");
+  const dbPath = options?.dbPath ?? join(root, "state", "agents-md-watch.sqlite3");
   let nowMs = Date.parse("2026-06-25T12:00:00.000Z");
   const writeAgentsFile = (filePath: string, content: string) => {
     writeFileSync(filePath, content);
