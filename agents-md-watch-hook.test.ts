@@ -317,6 +317,23 @@ describe("agents watch hook", () => {
     );
   });
 
+  test("strict user prompt returns a block decision", () => {
+    const ctx = createFixture({ mode: "strict", stableDelayMs: 0 });
+    const payload = { sessionId: "session-strict-user-prompt", cwd: ctx.cwd };
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed before strict prompt\n");
+
+    const result = runHook({ command: "user-prompt" }, payload, ctx.options);
+    const hookOutput = result.response.hookSpecificOutput as Record<string, string>;
+
+    expect(result.alerts).toHaveLength(1);
+    expect(result.response.decision).toBe("block");
+    expect(result.response.reason).toBeString();
+    expect(hookOutput.hookEventName).toBe("UserPromptSubmit");
+    expect(hookOutput).not.toHaveProperty("permissionDecision");
+  });
+
   test("strict post-tool stops the run", () => {
     const ctx = createFixture({ mode: "strict" });
     const payload = { sessionId: "session-strict-post", cwd: ctx.cwd };

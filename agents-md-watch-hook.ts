@@ -119,6 +119,7 @@ interface RunHookResult {
 const DEFAULT_MODE: WatchMode = "warn";
 const DEFAULT_STABLE_DELAY_MS = 10_000;
 const DEFAULT_RETENTION_DAYS = 30;
+const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const DIFF_CONTEXT_LINES = 3;
 const LCS_CELL_LIMIT = 1_500_000;
 const MAX_DIFF_LINES = 400;
@@ -368,7 +369,18 @@ function parseHookPayload(stdinText: string): HookPayload {
 
 function openDatabase(dbPath: string): Database {
   mkdirSync(dirname(dbPath), { recursive: true });
-  return new Database(dbPath);
+  const db = new Database(dbPath);
+
+  db.exec(`PRAGMA busy_timeout = ${SQLITE_BUSY_TIMEOUT_MS}`);
+
+  try {
+    db.exec("PRAGMA journal_mode = WAL");
+    db.exec("PRAGMA synchronous = NORMAL");
+  } catch {
+    return db;
+  }
+
+  return db;
 }
 
 function ensureSchema(db: Database): void {
@@ -1288,13 +1300,16 @@ function buildHookResponse(
   };
 
   if (mode === "strict") {
-    if (command === "pre-tool" || command === "user-prompt") {
+    if (command === "pre-tool") {
       response.hookSpecificOutput = {
         hookEventName,
         additionalContext: detail,
         permissionDecision: "deny",
         permissionDecisionReason: "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.",
       };
+    } else if (command === "user-prompt") {
+      response.decision = "block";
+      response.reason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
     } else if (command === "post-tool") {
       response.continue = false;
       response.stopReason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
