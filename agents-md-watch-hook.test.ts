@@ -267,6 +267,43 @@ describe("agents watch hook", () => {
     expect(result.alerts[0]?.path).toBe(ctx.globalAgentsPath);
   });
 
+  test("agents variant files are tracked and named in alerts", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-variant", cwd: ctx.cwd };
+    const localAgentsPath = join(ctx.projectRoot, "AGENTS.local.md");
+
+    ctx.writeAgentsFile(localAgentsPath, "# local baseline\n");
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(localAgentsPath, "# local changed\n");
+
+    const result = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const message = String(result.response.systemMessage);
+
+    expect(result.alerts).toHaveLength(1);
+    expect(result.alerts[0]?.path).toBe(localAgentsPath);
+    expect(message).toContain("AGENTS.local.md");
+    expect(message).toContain("--- a/../../AGENTS.local.md");
+    expect(message).toContain("+++ b/../../AGENTS.local.md");
+  });
+
+  test("new agents variant files created during a session trigger an alert", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-new-variant", cwd: ctx.cwd };
+    const extraAgentsPath = join(ctx.projectRoot, "AGENTS.extra.md");
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(extraAgentsPath, "# extra agents\n");
+
+    const result = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const message = String(result.response.systemMessage);
+
+    expect(result.alerts).toHaveLength(1);
+    expect(result.alerts[0]?.path).toBe(extraAgentsPath);
+    expect(message).toContain("AGENTS.extra.md");
+    expect(message).toContain("--- /dev/null");
+    expect(message).toContain("+++ b/../../AGENTS.extra.md");
+  });
+
   test("global file alert response keeps an absolute path", () => {
     const ctx = createFixture({ stableDelayMs: 0 });
     const payload = { sessionId: "session-global-absolute", cwd: ctx.cwd };
@@ -559,6 +596,7 @@ function createFixture(options?: {
 
   return {
     cwd,
+    projectRoot,
     globalAgentsPath,
     projectAgentsPath,
     writeAgentsFile,

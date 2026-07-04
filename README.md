@@ -1,12 +1,12 @@
 # agents-md-watch
 
-这是一套给 Codex hooks 用的 `AGENTS.md` 变更观察工具.
+这是一套给 Codex hooks 用的 AGENTS 指令文件变更观察工具.
 
 它解决两个问题:
 
 - 数据库存储可以共享, 但观察状态按 session 隔离.
 - fork 出来的 session 会继承父 session 的观察状态.
-- agent 工作途中通过 `UserPromptSubmit`, `PreToolUse` 和 `PostToolUse` 检查 `AGENTS.md` 是否变化, 并在变化稳定后提醒.
+- agent 工作途中通过 `UserPromptSubmit`, `PreToolUse` 和 `PostToolUse` 检查 AGENTS 指令文件是否变化, 并在变化稳定后提醒.
 
 ## 仓库文件
 
@@ -45,7 +45,7 @@ bun run print:hooks
 `session-start`
 
 - 为当前 session 建立基线.
-- 记录全局层和项目层的 `AGENTS.md` / `AGENTS.override.md` 快照.
+- 记录全局层和项目层的 `AGENTS.md`, `AGENTS.override.md` 和 `AGENTS.*.md` 快照.
 - 如果 hook payload 带有父 session / 父 thread 标识, 且数据库中存在父 session 的观察记录, fork session 会继承父 session 的观察状态.
 
 `user-prompt`
@@ -201,5 +201,5 @@ bun test
 - 文件再次变化并稳定后会再次提醒.
 - 用户提问时会检查 AGENTS 文件变化.
 - 稳定等待时间可以自定义.
-- 启动时不存在的 AGENTS 文件, 后续创建后也会提醒.
+- 启动时不存在或 session 中途新增的 AGENTS 文件, 后续创建后也会提醒.
 - 严格模式下的 `PreToolUse` 和 `PostToolUse` 返回格式.

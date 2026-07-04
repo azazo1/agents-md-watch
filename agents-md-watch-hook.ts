@@ -2,7 +2,13 @@
 
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 type HookCommand =
@@ -81,6 +87,11 @@ interface TrackedFileRow {
   last_change_at: string | null;
 }
 
+interface TrackedFilePathRow {
+  path: string;
+  scope: Scope;
+}
+
 interface InheritedTrackedFileRow {
   path: string;
   scope: Scope;
@@ -124,6 +135,8 @@ const DIFF_CONTEXT_LINES = 3;
 const LCS_CELL_LIMIT = 1_500_000;
 const MAX_DIFF_LINES = 400;
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const FIXED_AGENT_FILE_NAMES = ["AGENTS.md", "AGENTS.override.md"] as const;
+const AGENT_VARIANT_FILE_PATTERN = /^AGENTS\..+\.md$/;
 const SESSION_ID_KEYS = [
   "sessionId",
   "session_id",
@@ -876,7 +889,7 @@ function checkForChanges(
   now: string,
   stableDelayMs: number,
 ): AlertRecord[] {
-  const snapshots = collectSnapshots(session);
+  const snapshots = collectSnapshotsWithTrackedFiles(db, session);
   const selectTracked = db.prepare(`
     SELECT
       session_key,
@@ -913,6 +926,28 @@ function checkForChanges(
       last_change_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL)
   `);
+  const insertDiscoveredTracked = db.prepare(`
+    INSERT INTO tracked_files (
+      session_key,
+      path,
+      scope,
+      baseline_exists,
+      baseline_size,
+      baseline_mtime_ns,
+      baseline_sha256,
+      baseline_signature,
+      baseline_content,
+      last_seen_exists,
+      last_seen_size,
+      last_seen_mtime_ns,
+      last_seen_sha256,
+      last_seen_signature,
+      last_seen_content,
+      last_notified_signature,
+      last_notified_content,
+      last_change_at
+    ) VALUES (?, ?, ?, 0, '0', '0', '', 'missing', NULL, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+  `);
   const updateLastSeen = db.prepare(`
     UPDATE tracked_files
     SET
@@ -945,6 +980,7 @@ function checkForChanges(
     ) VALUES (?, ?, ?, ?, ?, ?)
   `);
   const alerts: AlertRecord[] = [];
+  const sessionHadTrackedFiles = hasTrackedFiles(db, session.sessionKey);
 
   db.transaction(() => {
     for (const snapshot of snapshots) {
@@ -954,7 +990,51 @@ function checkForChanges(
       ) as TrackedFileRow | null;
 
       if (!existing) {
-        insertTracked.run(...trackedInsertValues(session.sessionKey, snapshot));
+        if (!sessionHadTrackedFiles || !snapshot.exists) {
+          insertTracked.run(...trackedInsertValues(session.sessionKey, snapshot));
+          continue;
+        }
+
+        const pendingSince = snapshotMtimeIso(snapshot) ?? now;
+        insertDiscoveredTracked.run(
+          session.sessionKey,
+          snapshot.path,
+          snapshot.scope,
+          snapshot.exists ? 1 : 0,
+          snapshot.size,
+          snapshot.mtimeNs,
+          snapshot.sha256,
+          snapshot.signature,
+          snapshot.content,
+          pendingSince,
+        );
+
+        if (!hasStableDelayElapsed(pendingSince, now, stableDelayMs)) {
+          continue;
+        }
+
+        alerts.push({
+          path: snapshot.path,
+          scope: snapshot.scope,
+          previousSignature: "missing",
+          currentSignature: snapshot.signature,
+          previousContent: null,
+          currentContent: snapshot.content,
+        });
+        markAlerted.run(
+          snapshot.signature,
+          snapshot.content,
+          session.sessionKey,
+          snapshot.path,
+        );
+        insertAlert.run(
+          session.sessionKey,
+          snapshot.path,
+          snapshot.scope,
+          "missing",
+          snapshot.signature,
+          now,
+        );
         continue;
       }
 
@@ -1014,6 +1094,32 @@ function checkForChanges(
   })();
 
   return alerts;
+}
+
+function collectSnapshotsWithTrackedFiles(
+  db: Database,
+  session: SessionContext,
+): FileSnapshot[] {
+  const snapshots = collectSnapshots(session);
+  const knownPaths = new Set(snapshots.map((snapshot) => snapshot.path));
+  const trackedRows = db.prepare(`
+    SELECT path, scope
+    FROM tracked_files
+    WHERE session_key = ?
+  `).all(session.sessionKey) as TrackedFilePathRow[];
+
+  for (const row of trackedRows) {
+    const filePath = resolve(row.path);
+
+    if (knownPaths.has(filePath)) {
+      continue;
+    }
+
+    snapshots.push(snapshotFile(filePath, row.scope));
+    knownPaths.add(filePath);
+  }
+
+  return snapshots.sort((left, right) => left.path.localeCompare(right.path));
 }
 
 function resolvePendingSince(
@@ -1145,17 +1251,44 @@ function collectSnapshots(session: SessionContext): FileSnapshot[] {
   const directories = buildDirectoryChain(session.projectRoot, session.cwd);
   const candidates = new Map<string, Scope>();
 
-  candidates.set(join(session.codexHome, "AGENTS.md"), "global");
-  candidates.set(join(session.codexHome, "AGENTS.override.md"), "global");
+  collectAgentFileCandidates(candidates, session.codexHome, "global");
 
   for (const directory of directories) {
-    candidates.set(join(directory, "AGENTS.md"), "project");
-    candidates.set(join(directory, "AGENTS.override.md"), "project");
+    collectAgentFileCandidates(candidates, directory, "project");
   }
 
   return [...candidates.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([filePath, scope]) => snapshotFile(filePath, scope));
+}
+
+function collectAgentFileCandidates(
+  candidates: Map<string, Scope>,
+  directory: string,
+  scope: Scope,
+): void {
+  for (const fileName of FIXED_AGENT_FILE_NAMES) {
+    candidates.set(join(directory, fileName), scope);
+  }
+
+  for (const fileName of listExistingAgentVariantFiles(directory)) {
+    candidates.set(join(directory, fileName), scope);
+  }
+}
+
+function listExistingAgentVariantFiles(directory: string): string[] {
+  try {
+    return readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && isAgentVariantFileName(entry.name))
+      .map((entry) => entry.name)
+      .sort((left, right) => left.localeCompare(right));
+  } catch {
+    return [];
+  }
+}
+
+function isAgentVariantFileName(fileName: string): boolean {
+  return AGENT_VARIANT_FILE_PATTERN.test(fileName);
 }
 
 function buildDirectoryChain(projectRoot: string, cwd: string): string[] {
