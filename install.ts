@@ -11,6 +11,7 @@ type WatchMode = "warn" | "strict";
 interface HookCommandConfig {
   type: "command";
   command: string;
+  commandWindows?: string;
   timeout?: number;
   statusMessage?: string;
 }
@@ -56,6 +57,10 @@ const parsed = parseArgs({
       type: "string",
       default: "~/.codex/hooks.json",
     },
+    "codex-home": {
+      type: "string",
+      default: process.env.CODEX_HOME ?? "~/.codex",
+    },
     "print-only": {
       type: "boolean",
       default: false,
@@ -72,9 +77,11 @@ const repoRoot = dirname(fileURLToPath(import.meta.url));
 const targetDir = expandHome(parsed.values["target-dir"]);
 const dbPath = expandHome(parsed.values["db-path"]);
 const hooksJsonPath = expandHome(parsed.values["hooks-json"]);
+const codexHome = expandHome(parsed.values["codex-home"]);
 const generatedHooks = buildHooksConfig(
   join(targetDir, "agents-md-watch-hook.ts"),
   dbPath,
+  codexHome,
   mode,
   stableDelaySeconds,
 );
@@ -98,6 +105,7 @@ writeFileSync(generatedHooksPath, `${JSON.stringify(generatedHooks, null, 2)}\n`
 const summary = [
   `已安装到: ${targetDir}`,
   `数据库路径: ${dbPath}`,
+  `codex home: ${codexHome}`,
   `模式: ${mode}`,
   `稳定等待: ${stableDelaySeconds}s`,
   `hooks.json: ${hooksMergeResult}`,
@@ -139,11 +147,20 @@ function expandHome(pathText: string): string {
 function buildHooksConfig(
   installedHookPath: string,
   dbPath: string,
+  codexHome: string,
   mode: WatchMode,
   stableDelaySeconds: number,
 ): HooksFile {
-  const renderCommand = (eventCommand: string) =>
-    `bun ${shellQuote(installedHookPath)} ${eventCommand} --db-path ${shellQuote(dbPath)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
+  const renderPosixCommand = (eventCommand: string) =>
+    `bun ${shellQuotePosix(installedHookPath)} ${eventCommand} --db-path ${shellQuotePosix(dbPath)} --codex-home ${shellQuotePosix(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
+  const renderWindowsCommand = (eventCommand: string) =>
+    `bun ${shellQuoteWindows(installedHookPath)} ${eventCommand} --db-path ${shellQuoteWindows(dbPath)} --codex-home ${shellQuoteWindows(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
+
+  const hookCommand = (eventCommand: string) => ({
+    type: "command" as const,
+    command: renderPosixCommand(eventCommand),
+    commandWindows: renderWindowsCommand(eventCommand),
+  });
 
   return {
     hooks: {
@@ -152,8 +169,7 @@ function buildHooksConfig(
           matcher: ".*",
           hooks: [
             {
-              type: "command",
-              command: renderCommand("session-start"),
+              ...hookCommand("session-start"),
               timeout: 10,
               statusMessage: "Recording AGENTS baseline",
             },
@@ -165,8 +181,7 @@ function buildHooksConfig(
           matcher: ".*",
           hooks: [
             {
-              type: "command",
-              command: renderCommand("pre-tool"),
+              ...hookCommand("pre-tool"),
               timeout: 10,
               statusMessage: "Checking AGENTS changes",
             },
@@ -177,8 +192,7 @@ function buildHooksConfig(
         {
           hooks: [
             {
-              type: "command",
-              command: renderCommand("user-prompt"),
+              ...hookCommand("user-prompt"),
               timeout: 10,
               statusMessage: "Checking AGENTS changes",
             },
@@ -190,8 +204,7 @@ function buildHooksConfig(
           matcher: ".*",
           hooks: [
             {
-              type: "command",
-              command: renderCommand("post-tool"),
+              ...hookCommand("post-tool"),
               timeout: 10,
               statusMessage: "Checking AGENTS changes",
             },
@@ -203,8 +216,7 @@ function buildHooksConfig(
           matcher: ".*",
           hooks: [
             {
-              type: "command",
-              command: renderCommand("stop"),
+              ...hookCommand("stop"),
               timeout: 10,
             },
           ],
@@ -255,10 +267,18 @@ function isAgentsWatchHook(hook: HookCommandConfig): boolean {
   return hook.command.includes("agents-md-watch-hook.ts");
 }
 
-function shellQuote(value: string): string {
+function shellQuotePosix(value: string): string {
   if (/^[A-Za-z0-9_./:@-]+$/.test(value)) {
     return value;
   }
 
   return `'${value.replaceAll("'", `'\"'\"'`)}'`;
+}
+
+function shellQuoteWindows(value: string): string {
+  if (/^[A-Za-z0-9_./:@-]+$/.test(value)) {
+    return value;
+  }
+
+  return `"${value.replaceAll('"', '\\"')}"`;
 }
