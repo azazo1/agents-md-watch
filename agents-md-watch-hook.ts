@@ -239,8 +239,7 @@ export function runHook(
           response: {},
         };
       case "user-prompt":
-      case "pre-tool":
-      case "post-tool": {
+      case "pre-tool": {
         ensureSessionRow(db, session, now);
         cleanupOldRecords(db, now, session.sessionKey);
         const alerts = checkForChanges(db, session, now, stableDelayMs);
@@ -256,6 +255,13 @@ export function runHook(
           response,
         };
       }
+      case "post-tool":
+        // Legacy PostToolUse entries must never insert context between calls and outputs.
+        return {
+          sessionKey: session.sessionKey,
+          alerts: [],
+          response: {},
+        };
       case "stop":
         markSessionStopped(db, session.sessionKey, now);
         cleanupOldRecords(db, now, session.sessionKey);
@@ -1424,29 +1430,27 @@ function buildHookResponse(
     ...diffLines,
     "请按最新指令继续后续工作.",
   ].join("\n");
-  const response: Record<string, JsonValue> = {
-    systemMessage: detail,
-    hookSpecificOutput: {
+  const response: Record<string, JsonValue> = { systemMessage: detail };
+
+  if (command === "pre-tool") {
+    response.hookSpecificOutput = {
+      hookEventName,
+      permissionDecision: "deny",
+      permissionDecisionReason: [
+        detail,
+        "本次工具调用已取消. 请重新读取指令后继续.",
+      ].join("\n"),
+    };
+  } else {
+    response.hookSpecificOutput = {
       hookEventName,
       additionalContext: detail,
-    },
-  };
+    };
+  }
 
-  if (mode === "strict") {
-    if (command === "pre-tool") {
-      response.hookSpecificOutput = {
-        hookEventName,
-        additionalContext: detail,
-        permissionDecision: "deny",
-        permissionDecisionReason: "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.",
-      };
-    } else if (command === "user-prompt") {
-      response.decision = "block";
-      response.reason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
-    } else if (command === "post-tool") {
-      response.continue = false;
-      response.stopReason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
-    }
+  if (mode === "strict" && command === "user-prompt") {
+    response.decision = "block";
+    response.reason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
   }
 
   return response;

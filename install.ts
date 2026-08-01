@@ -199,18 +199,6 @@ function buildHooksConfig(
           ],
         },
       ],
-      PostToolUse: [
-        {
-          matcher: ".*",
-          hooks: [
-            {
-              ...hookCommand("post-tool"),
-              timeout: 10,
-              statusMessage: "Checking AGENTS changes",
-            },
-          ],
-        },
-      ],
       Stop: [
         {
           matcher: ".*",
@@ -244,13 +232,23 @@ function mergeHooksJson(hooksJsonPath: string, incoming: HooksFile): string {
     }
   }
 
-  for (const [eventName, matcherConfigs] of Object.entries(incoming.hooks)) {
-    const targetList = (existing.hooks[eventName] ?? [])
+  for (const [eventName, matcherConfigs] of Object.entries(existing.hooks)) {
+    const retainedMatchers = matcherConfigs
       .map((entry) => ({
         ...entry,
         hooks: entry.hooks.filter((hook) => !isAgentsWatchHook(hook)),
       }))
       .filter((entry) => entry.hooks.length > 0);
+
+    if (retainedMatchers.length === 0) {
+      delete existing.hooks[eventName];
+    } else {
+      existing.hooks[eventName] = retainedMatchers;
+    }
+  }
+
+  for (const [eventName, matcherConfigs] of Object.entries(incoming.hooks)) {
+    const targetList = existing.hooks[eventName] ?? [];
 
     for (const matcherConfig of matcherConfigs) {
       targetList.push(matcherConfig);

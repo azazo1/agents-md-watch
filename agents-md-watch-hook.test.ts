@@ -64,7 +64,7 @@ describe("agents watch hook", () => {
     ctx.advanceSeconds(10);
 
     const first = runHook({ command: "pre-tool" }, payload, ctx.options);
-    const second = runHook({ command: "post-tool" }, payload, ctx.options);
+    const second = runHook({ command: "pre-tool" }, payload, ctx.options);
 
     expect(pending.alerts).toHaveLength(0);
     expect(first.alerts).toHaveLength(1);
@@ -371,20 +371,33 @@ describe("agents watch hook", () => {
     expect(hookOutput).not.toHaveProperty("permissionDecision");
   });
 
-  test("strict post-tool stops the run", () => {
-    const ctx = createFixture({ mode: "strict" });
-    const payload = { sessionId: "session-strict-post", cwd: ctx.cwd };
+  test("legacy post-tool hooks do not inspect or inject context", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-legacy-post", cwd: ctx.cwd };
 
     runHook({ command: "session-start" }, payload, ctx.options);
     ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed once\n");
 
-    runHook({ command: "post-tool" }, payload, ctx.options);
-    ctx.advanceSeconds(10);
-
     const result = runHook({ command: "post-tool" }, payload, ctx.options);
 
-    expect(result.response.continue).toBe(false);
-    expect(result.response.stopReason).toBeString();
+    expect(result.alerts).toHaveLength(0);
+    expect(result.response).toEqual({});
+  });
+
+  test("warn pre-tool cancels once without injecting developer context", () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = { sessionId: "session-warn-pre", cwd: ctx.cwd };
+
+    runHook({ command: "session-start" }, payload, ctx.options);
+    ctx.writeAgentsFile(ctx.projectAgentsPath, "# changed once\n");
+
+    const result = runHook({ command: "pre-tool" }, payload, ctx.options);
+    const hookOutput = result.response.hookSpecificOutput as Record<string, string>;
+
+    expect(result.alerts).toHaveLength(1);
+    expect(hookOutput.hookEventName).toBe("PreToolUse");
+    expect(hookOutput.permissionDecision).toBe("deny");
+    expect(hookOutput).not.toHaveProperty("additionalContext");
   });
 
   test("removes database records older than thirty days", () => {
@@ -513,6 +526,22 @@ describe("agents watch installer", () => {
                 ],
               },
             ],
+            PostToolUse: [
+              {
+                matcher: ".*",
+                hooks: [
+                  {
+                    type: "command",
+                    command:
+                      "bun /old/agents-md-watch-hook.ts post-tool --stable-delay-seconds 1",
+                  },
+                  {
+                    type: "command",
+                    command: "echo keep post",
+                  },
+                ],
+              },
+            ],
           },
         },
         null,
@@ -552,12 +581,16 @@ describe("agents watch installer", () => {
     const userPromptCommands = installed.hooks.UserPromptSubmit.flatMap((entry) =>
       entry.hooks.map((hook) => hook.command),
     );
+    const postToolCommands = installed.hooks.PostToolUse.flatMap((entry) =>
+      entry.hooks.map((hook) => hook.command),
+    );
 
     expect(preToolCommands).toContain(keepCommand);
     expect(agentsCommands).toHaveLength(1);
     expect(agentsCommands[0]).toContain("--stable-delay-seconds 4");
     expect(userPromptCommands).toHaveLength(1);
     expect(userPromptCommands[0]).toContain("user-prompt");
+    expect(postToolCommands).toEqual(["echo keep post"]);
   });
 });
 

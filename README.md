@@ -6,7 +6,7 @@
 
 - 数据库存储可以共享, 但观察状态按 session 隔离.
 - fork 出来的 session 会继承父 session 的观察状态.
-- agent 工作途中通过 `UserPromptSubmit`, `PreToolUse` 和 `PostToolUse` 检查 AGENTS 指令文件是否变化, 并在变化稳定后提醒.
+- agent 工作途中通过 `UserPromptSubmit` 和 `PreToolUse` 检查 AGENTS 指令文件是否变化, 并在变化稳定后提醒.
 
 ## 仓库文件
 
@@ -53,21 +53,16 @@ bun run print:hooks
 - 用户提交新提问时检查快照.
 - `warn` 模式下在变化稳定后返回提醒.
 - 提醒内容会包含 AGENTS 文件的 unified diff.
-- `strict` 模式下返回 `permissionDecision: deny`.
+- `strict` 模式下返回 `decision: block`.
 
 `pre-tool`
 
 - agent 每次准备调用工具前检查快照.
-- `warn` 模式下在变化稳定后返回提醒.
-- 提醒内容会包含 AGENTS 文件的 unified diff.
-- `strict` 模式下返回 `permissionDecision: deny`.
+- `warn` 模式下发现稳定变化会取消当前一次工具调用, 让 agent 先重新读取指令再继续.
+- 提醒会显示在 Codex UI 中. 这避免在待处理 tool result 中插入 developer context.
+- `strict` 模式下使用相同的工具取消行为, 并在 `UserPromptSubmit` 中返回 `decision: block`.
 
-`post-tool`
-
-- agent 每次工具执行后再次检查.
-- `warn` 模式下在变化稳定后返回提醒.
-- 提醒内容会包含 AGENTS 文件的 unified diff.
-- `strict` 模式下返回 `continue: false`.
+安装器不会注册 `PostToolUse`. 某些兼容模型要求 tool call 和 tool result 保持连续. 在二者之间注入 developer context 会导致请求失败. 已存在的旧版 `post-tool` 配置在重新安装前会作为无输出兼容分支运行.
 
 `stop`
 
@@ -175,7 +170,7 @@ bun ./install.ts \
 
 1. 删除安装目录 `~/.codex/agents-md-watch`.
 2. 删除数据库文件 `~/.codex/state/agents-md-watch.sqlite3`.
-3. 打开 `~/.codex/hooks.json`, 删除 command 指向 `agents-md-watch-hook.ts` 的 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` hooks.
+3. 打开 `~/.codex/hooks.json`, 删除 command 指向 `agents-md-watch-hook.ts` 的 `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `Stop` hooks.
 
 如果这份 `hooks.json` 只给这个项目使用, 也可以在确认没有其他自定义 hooks 后直接删除整个文件.
 
@@ -202,4 +197,4 @@ bun test
 - 用户提问时会检查 AGENTS 文件变化.
 - 稳定等待时间可以自定义.
 - 启动时不存在或 session 中途新增的 AGENTS 文件, 后续创建后也会提醒.
-- 严格模式下的 `PreToolUse` 和 `PostToolUse` 返回格式.
+- `PreToolUse` 会安全中断一次待执行工具, 不会插入 developer context.
