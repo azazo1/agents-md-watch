@@ -26,6 +26,20 @@ afterEach(() => {
 });
 
 describe("agents watch hook", () => {
+  test("session start injects the tracked agents scope", () => {
+    const ctx = createFixture();
+    const payload = { sessionId: "session-start-scope", cwd: ctx.cwd };
+
+    const result = runHook({ command: "session-start" }, payload, ctx.options);
+    const output = result.response.hookSpecificOutput as Record<string, string>;
+
+    expect(output.hookEventName).toBe("SessionStart");
+    expect(output.additionalContext).toContain(ctx.globalAgentsPath);
+    expect(output.additionalContext).toContain(ctx.projectAgentsPath);
+    expect(output.additionalContext).toContain("global");
+    expect(output.additionalContext).toContain("project");
+  });
+
   test("each session keeps its own alert state", () => {
     const ctx = createFixture();
     const payloadA = { sessionId: "session-a", cwd: ctx.cwd };

@@ -236,7 +236,7 @@ export function runHook(
         return {
           sessionKey: session.sessionKey,
           alerts: [],
-          response: {},
+          response: buildSessionStartResponse(session),
         };
       case "user-prompt":
       case "pre-tool": {
@@ -1396,6 +1396,34 @@ function resolvePreviousContent(
   return undefined;
 }
 
+function buildSessionStartResponse(
+  session: SessionContext,
+): Record<string, JsonValue> {
+  const snapshots = collectSnapshots(session).filter(
+    (snapshot) => snapshot.exists,
+  );
+
+  if (snapshots.length === 0) {
+    return {};
+  }
+
+  const lines = snapshots.map(
+    (snapshot) => `- ${snapshot.scope} ${snapshot.path}`,
+  );
+  const additionalContext = [
+    "当前 session 的 AGENTS 指令文件范围:",
+    ...lines,
+    "这些文件已被本工具跟踪, 请将没有读取的文件进行读取获悉具体情况, 后续内容变化时会再次提示.",
+  ].join("\n");
+
+  return {
+    hookSpecificOutput: {
+      hookEventName: "SessionStart",
+      additionalContext,
+    },
+  };
+}
+
 function buildHookResponse(
   alerts: AlertRecord[],
   command: HookCommand,
@@ -1637,7 +1665,7 @@ function buildWindowDiffLines(
     suffixLength < previousLines.length - prefixLength &&
     suffixLength < currentLines.length - prefixLength &&
     previousLines[previousLines.length - 1 - suffixLength] ===
-      currentLines[currentLines.length - 1 - suffixLength]
+    currentLines[currentLines.length - 1 - suffixLength]
   ) {
     suffixLength += 1;
   }

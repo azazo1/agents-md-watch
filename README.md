@@ -47,6 +47,8 @@ bun run print:hooks
 - 为当前 session 建立基线.
 - 记录全局层和项目层的 `AGENTS.md`, `AGENTS.override.md` 和 `AGENTS.*.md` 快照.
 - 如果 hook payload 带有父 session / 父 thread 标识, 且数据库中存在父 session 的观察记录, fork session 会继承父 session 的观察状态.
+- 返回 `SessionStart` 的 `additionalContext`, 告诉模型当前 session 生效的 AGENTS 文件范围.
+- 范围只包含已存在的 global 和 project 层文件路径, 不重复注入文件内容.
 
 `user-prompt`
 
@@ -198,3 +200,4 @@ bun test
 - 稳定等待时间可以自定义.
 - 启动时不存在或 session 中途新增的 AGENTS 文件, 后续创建后也会提醒.
 - `PreToolUse` 会安全中断一次待执行工具, 不会插入 developer context.
+- `SessionStart` 会返回 AGENTS 文件范围给模型.
