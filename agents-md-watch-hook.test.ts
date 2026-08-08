@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -11,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 
-import { runHook } from "./agents-md-watch-hook";
+import { runHook, runHookWithLogging } from "./agents-md-watch-hook";
 
 const testRoots: string[] = [];
 
@@ -507,6 +508,93 @@ describe("agents watch hook", () => {
       expect(columnNames).toContain("last_notified_content");
     });
   });
+
+  test("writes hook success and failure logs", () => {
+    const ctx = createFixture();
+    const logPath = join(ctx.projectRoot, "state", "hook.log");
+
+    ctx.options.logPath = logPath;
+    ctx.options.logMaxBytes = 1024 * 1024;
+
+    const payload = { sessionId: "session-log", cwd: ctx.cwd };
+    const result = runHookWithLogging(
+      { command: "session-start" },
+      payload,
+      ctx.options,
+    );
+
+    expect(result.sessionKey).toBe("session-log");
+
+    const firstLines = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    expect(firstLines).toHaveLength(1);
+    expect(firstLines[0]).toMatchObject({
+      level: "info",
+      status: "ok",
+      command: "session-start",
+      sessionKey: "session-log",
+    });
+
+    const badCliOptions = {
+      command: "bad-command",
+    } as unknown as Parameters<typeof runHookWithLogging>[0];
+
+    expect(() =>
+      runHookWithLogging(badCliOptions, payload, ctx.options),
+    ).toThrow();
+
+    const secondLines = readFileSync(logPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+
+    expect(secondLines).toHaveLength(2);
+    expect(secondLines[1]).toMatchObject({
+      level: "error",
+      status: "error",
+      command: "bad-command",
+      sessionKey: "session-log",
+    });
+    expect(secondLines[1].error.message).toContain("Unsupported command");
+  });
+
+  test("rotates hook logs and cleans expired backups", () => {
+    const ctx = createFixture();
+    const logPath = join(ctx.projectRoot, "state", "hook.log");
+    const oldBackupPath = `${logPath}.9`;
+    const oldDate = new Date(Date.parse("2026-05-01T00:00:00.000Z"));
+
+    ctx.options.logPath = logPath;
+    ctx.options.logMaxBytes = 300;
+    ctx.options.logKeepFiles = 2;
+    ctx.options.logRetentionDays = 30;
+
+    mkdirSync(dirname(logPath), { recursive: true });
+    writeFileSync(oldBackupPath, "old backup\n");
+    utimesSync(oldBackupPath, oldDate, oldDate);
+
+    const payload = { sessionId: "session-rotate", cwd: ctx.cwd };
+
+    for (let index = 0; index < 8; index += 1) {
+      runHookWithLogging(
+        { command: "session-start" },
+        payload,
+        ctx.options,
+      );
+    }
+
+    expect(existsSync(logPath)).toBe(true);
+    expect(existsSync(`${logPath}.1`)).toBe(true);
+    expect(existsSync(`${logPath}.2`)).toBe(true);
+    expect(existsSync(`${logPath}.3`)).toBe(false);
+    expect(existsSync(oldBackupPath)).toBe(false);
+    expect(
+      readFileSync(logPath, "utf8").trim().split("\n").length,
+    ).toBeGreaterThan(0);
+  });
 });
 
 describe("agents watch installer", () => {
@@ -516,6 +604,7 @@ describe("agents watch installer", () => {
 
     const targetDir = join(root, "target");
     const dbPath = join(root, "state", "watch.sqlite3");
+    const logPath = join(root, "state", "hook.log");
     const hooksJsonPath = join(root, "hooks.json");
     const keepCommand = "echo keep";
 
@@ -575,6 +664,14 @@ describe("agents watch installer", () => {
         hooksJsonPath,
         "--stable-delay-seconds",
         "4",
+        "--log-path",
+        logPath,
+        "--log-max-bytes",
+        "2048",
+        "--log-keep-files",
+        "3",
+        "--log-retention-days",
+        "14",
       ],
       cwd: import.meta.dir,
       stdout: "pipe",
@@ -602,6 +699,10 @@ describe("agents watch installer", () => {
     expect(preToolCommands).toContain(keepCommand);
     expect(agentsCommands).toHaveLength(1);
     expect(agentsCommands[0]).toContain("--stable-delay-seconds 4");
+    expect(agentsCommands[0]).toContain(`--log-path ${logPath}`);
+    expect(agentsCommands[0]).toContain("--log-max-bytes 2048");
+    expect(agentsCommands[0]).toContain("--log-keep-files 3");
+    expect(agentsCommands[0]).toContain("--log-retention-days 14");
     expect(userPromptCommands).toHaveLength(1);
     expect(userPromptCommands[0]).toContain("user-prompt");
     expect(postToolCommands).toEqual(["echo keep post"]);

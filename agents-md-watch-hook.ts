@@ -3,13 +3,16 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
   statSync,
+  unlinkSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 type HookCommand =
   | "session-start"
@@ -39,6 +42,10 @@ interface HookCliOptions {
   projectRoot?: string;
   codexHome?: string;
   stableDelayMs?: number;
+  logPath?: string;
+  logMaxBytes?: number;
+  logKeepFiles?: number;
+  logRetentionDays?: number;
 }
 
 interface RunHookOptions {
@@ -48,6 +55,10 @@ interface RunHookOptions {
   codexHome?: string;
   stableDelayMs?: number;
   now?: () => string;
+  logPath?: string;
+  logMaxBytes?: number;
+  logKeepFiles?: number;
+  logRetentionDays?: number;
 }
 
 interface SessionContext {
@@ -127,9 +138,29 @@ interface RunHookResult {
   response: Record<string, JsonValue>;
 }
 
+interface HookLogEntry {
+  timestamp: string;
+  level: "info" | "error";
+  status: "ok" | "error";
+  command: string;
+  sessionKey: string;
+  cwd: string;
+  projectRoot: string;
+  durationMs: number;
+  alerts: number;
+  error?: {
+    name: string;
+    message: string;
+    stack: string;
+  };
+}
+
 const DEFAULT_MODE: WatchMode = "warn";
 const DEFAULT_STABLE_DELAY_MS = 10_000;
 const DEFAULT_RETENTION_DAYS = 30;
+const DEFAULT_LOG_MAX_BYTES = 10 * 1024 * 1024;
+const DEFAULT_LOG_KEEP_FILES = 5;
+const DEFAULT_LOG_RETENTION_DAYS = 30;
 const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 const DIFF_CONTEXT_LINES = 3;
 const LCS_CELL_LIMIT = 1_500_000;
@@ -196,18 +227,51 @@ const PARENT_CONTAINER_KEYS = [
 const PARENT_CONTAINER_ID_KEYS = ["id", ...SESSION_ID_KEYS];
 
 export async function main(argv: string[]): Promise<void> {
-  const cliOptions = parseCli(argv);
-  const stdinText = await new Response(Bun.stdin.stream()).text();
-  const payload = parseHookPayload(stdinText);
-  const result = runHook(cliOptions, payload, {
-    dbPath: cliOptions.dbPath ?? defaultDbPath(),
-    mode: cliOptions.mode ?? DEFAULT_MODE,
-    projectRoot: cliOptions.projectRoot,
-    codexHome: cliOptions.codexHome,
-    stableDelayMs: cliOptions.stableDelayMs ?? DEFAULT_STABLE_DELAY_MS,
-  });
+  const startedAt = Date.now();
+  let cliOptions: HookCliOptions | undefined;
+  let payload: HookPayload = {};
+  let runStarted = false;
 
-  process.stdout.write(`${JSON.stringify(result.response, null, 2)}\n`);
+  try {
+    cliOptions = parseCli(argv);
+    const stdinText = await new Response(Bun.stdin.stream()).text();
+    payload = parseHookPayload(stdinText);
+    const options = resolveRunOptions(cliOptions);
+    runStarted = true;
+    const result = runHookWithLogging(cliOptions, payload, options);
+
+    process.stdout.write(`${JSON.stringify(result.response, null, 2)}\n`);
+  } catch (error) {
+    if (!runStarted) {
+      writeHookLog(
+        "error",
+        "error",
+        startedAt,
+        resolveRunOptions(cliOptions),
+        payload,
+        cliOptions,
+        undefined,
+        error,
+      );
+    }
+
+    throw error;
+  }
+}
+
+function resolveRunOptions(cliOptions?: HookCliOptions): RunHookOptions {
+  return {
+    dbPath: cliOptions?.dbPath ?? defaultDbPath(),
+    mode: cliOptions?.mode ?? DEFAULT_MODE,
+    projectRoot: cliOptions?.projectRoot,
+    codexHome: cliOptions?.codexHome,
+    stableDelayMs: cliOptions?.stableDelayMs ?? DEFAULT_STABLE_DELAY_MS,
+    logPath: cliOptions?.logPath ?? defaultLogPath(),
+    logMaxBytes: cliOptions?.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES,
+    logKeepFiles: cliOptions?.logKeepFiles ?? DEFAULT_LOG_KEEP_FILES,
+    logRetentionDays:
+      cliOptions?.logRetentionDays ?? DEFAULT_LOG_RETENTION_DAYS,
+  };
 }
 
 export function runHook(
@@ -278,6 +342,40 @@ export function runHook(
   }
 }
 
+export function runHookWithLogging(
+  cliOptions: HookCliOptions,
+  payload: HookPayload,
+  options: RunHookOptions,
+): RunHookResult {
+  const startedAt = Date.now();
+
+  try {
+    const result = runHook(cliOptions, payload, options);
+    writeHookLog(
+      "info",
+      "ok",
+      startedAt,
+      options,
+      payload,
+      cliOptions,
+      result,
+    );
+    return result;
+  } catch (error) {
+    writeHookLog(
+      "error",
+      "error",
+      startedAt,
+      options,
+      payload,
+      cliOptions,
+      undefined,
+      error,
+    );
+    throw error;
+  }
+}
+
 function parseCli(argv: string[]): HookCliOptions {
   const command = argv[2];
 
@@ -289,7 +387,7 @@ function parseCli(argv: string[]): HookCliOptions {
     command !== "stop"
   ) {
     throw new Error(
-      "Usage: bun agents-md-watch-hook.ts <session-start|user-prompt|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH] [--stable-delay-seconds SECONDS]",
+      "Usage: bun agents-md-watch-hook.ts <session-start|user-prompt|pre-tool|post-tool|stop> [--db-path PATH] [--mode warn|strict] [--project-root PATH] [--codex-home PATH] [--stable-delay-seconds SECONDS] [--log-path PATH] [--log-max-bytes BYTES] [--log-keep-files COUNT] [--log-retention-days DAYS]",
     );
   }
 
@@ -301,6 +399,16 @@ function parseCli(argv: string[]): HookCliOptions {
     codexHome: process.env.CODEX_HOME,
     stableDelayMs: readStableDelayMs(
       process.env.CODEX_AGENTS_WATCH_STABLE_DELAY_SECONDS,
+    ),
+    logPath: process.env.CODEX_AGENTS_WATCH_LOG_PATH,
+    logMaxBytes: readPositiveInteger(
+      process.env.CODEX_AGENTS_WATCH_LOG_MAX_BYTES,
+    ),
+    logKeepFiles: readPositiveInteger(
+      process.env.CODEX_AGENTS_WATCH_LOG_KEEP_FILES,
+    ),
+    logRetentionDays: readPositiveInteger(
+      process.env.CODEX_AGENTS_WATCH_LOG_RETENTION_DAYS,
     ),
   };
 
@@ -337,9 +445,47 @@ function parseCli(argv: string[]): HookCliOptions {
       index += 1;
       continue;
     }
+
+    if (flag === "--log-path" && value) {
+      cliOptions.logPath = value;
+      index += 1;
+      continue;
+    }
+
+    if (flag === "--log-max-bytes" && value) {
+      cliOptions.logMaxBytes = readPositiveInteger(value);
+      index += 1;
+      continue;
+    }
+
+    if (flag === "--log-keep-files" && value) {
+      cliOptions.logKeepFiles = readPositiveInteger(value);
+      index += 1;
+      continue;
+    }
+
+    if (flag === "--log-retention-days" && value) {
+      cliOptions.logRetentionDays = readPositiveInteger(value);
+      index += 1;
+      continue;
+    }
   }
 
   return cliOptions;
+}
+
+function readPositiveInteger(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const number = Number(value);
+
+  if (!Number.isInteger(number) || number <= 0) {
+    throw new Error(`Unsupported positive integer: ${value}`);
+  }
+
+  return number;
 }
 
 function readStableDelayMs(value: string | undefined): number | undefined {
@@ -1848,6 +1994,211 @@ function defaultCodexHome(): string {
 
 function defaultDbPath(): string {
   return join(defaultCodexHome(), "state", "agents-md-watch.sqlite3");
+}
+
+function defaultLogPath(): string {
+  return join(defaultCodexHome(), "state", "agents-md-watch-hook.log");
+}
+
+function writeHookLog(
+  level: "info" | "error",
+  status: "ok" | "error",
+  startedAt: number,
+  options: RunHookOptions,
+  payload: HookPayload,
+  cliOptions?: HookCliOptions,
+  result?: RunHookResult,
+  error?: unknown,
+): void {
+  if (!options.logPath) {
+    return;
+  }
+
+  const now = options.now?.() ?? new Date().toISOString();
+  const session = resolveLogSession(payload, options, result);
+  const entry: HookLogEntry = {
+    timestamp: now,
+    level,
+    status,
+    command: cliOptions?.command ?? "unknown",
+    sessionKey: session?.sessionKey ?? "unknown",
+    cwd: session?.cwd ?? options.projectRoot ?? process.cwd(),
+    projectRoot: session?.projectRoot ?? options.projectRoot ?? "",
+    durationMs: Date.now() - startedAt,
+    alerts: result?.alerts.length ?? 0,
+  };
+
+  if (error) {
+    entry.error = serializeError(error);
+  }
+
+  appendHookLog(entry, options);
+}
+
+function resolveLogSession(
+  payload: HookPayload,
+  options: RunHookOptions,
+  result?: RunHookResult,
+): {
+  sessionKey: string;
+  cwd: string;
+  projectRoot: string;
+} | undefined {
+  if (result?.sessionKey) {
+    try {
+      const session = resolveSessionContext(payload, options);
+
+      return {
+        sessionKey: session.sessionKey,
+        cwd: session.cwd,
+        projectRoot: session.projectRoot,
+      };
+    } catch {
+      return {
+        sessionKey: result.sessionKey,
+        cwd: options.projectRoot ?? process.cwd(),
+        projectRoot: options.projectRoot ?? "",
+      };
+    }
+  }
+
+  try {
+    const session = resolveSessionContext(payload, options);
+
+    return {
+      sessionKey: session.sessionKey,
+      cwd: session.cwd,
+      projectRoot: session.projectRoot,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function appendHookLog(entry: HookLogEntry, options: RunHookOptions): void {
+  const logPath = options.logPath;
+
+  if (!logPath) {
+    return;
+  }
+
+  try {
+    mkdirSync(dirname(logPath), { recursive: true });
+    cleanupLogBackups(logPath, options);
+    rotateLogFileIfNeeded(logPath, options);
+    appendFileSync(logPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    return;
+  }
+}
+
+function rotateLogFileIfNeeded(
+  logPath: string,
+  options: RunHookOptions,
+): void {
+  if (!existsSync(logPath)) {
+    return;
+  }
+
+  if (statSync(logPath).size < (options.logMaxBytes ?? DEFAULT_LOG_MAX_BYTES)) {
+    return;
+  }
+
+  const keepFiles = Math.max(
+    1,
+    options.logKeepFiles ?? DEFAULT_LOG_KEEP_FILES,
+  );
+  const directory = dirname(logPath);
+  const base = basename(logPath);
+
+  for (let index = keepFiles - 1; index >= 1; index -= 1) {
+    const source = join(directory, `${base}.${index}`);
+    const target = join(directory, `${base}.${index + 1}`);
+
+    if (existsSync(target)) {
+      unlinkSync(target);
+    }
+
+    if (existsSync(source)) {
+      renameSync(source, target);
+    }
+  }
+
+  const first = join(directory, `${base}.1`);
+
+  if (existsSync(first)) {
+    unlinkSync(first);
+  }
+
+  renameSync(logPath, first);
+}
+
+function cleanupLogBackups(
+  logPath: string,
+  options: RunHookOptions,
+): void {
+  const keepFiles = Math.max(
+    1,
+    options.logKeepFiles ?? DEFAULT_LOG_KEEP_FILES,
+  );
+  const retentionDays =
+    options.logRetentionDays ?? DEFAULT_LOG_RETENTION_DAYS;
+  const hasRetention = retentionDays > 0;
+
+  const nowText = options.now?.() ?? new Date().toISOString();
+  const nowMs = Date.parse(nowText);
+  const cutoffMs = nowMs - retentionDays * MS_PER_DAY;
+  const directory = dirname(logPath);
+  const base = basename(logPath);
+  const prefix = `${base}.`;
+
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.startsWith(prefix)) {
+      continue;
+    }
+
+    const suffix = entry.name.slice(prefix.length);
+
+    if (!/^\d+$/.test(suffix)) {
+      continue;
+    }
+
+    const filePath = join(directory, entry.name);
+    const backupIndex = Number(suffix);
+
+    try {
+      if (
+        backupIndex > keepFiles ||
+        (hasRetention &&
+          Number.isFinite(nowMs) &&
+          statSync(filePath).mtimeMs < cutoffMs)
+      ) {
+        unlinkSync(filePath);
+      }
+    } catch {
+      continue;
+    }
+  }
+}
+
+function serializeError(error: unknown): {
+  name: string;
+  message: string;
+  stack: string;
+} {
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message,
+      stack: error.stack ?? "",
+    };
+  }
+
+  return {
+    name: "Error",
+    message: String(error),
+    stack: "",
+  };
 }
 
 function digestText(value: string): string {

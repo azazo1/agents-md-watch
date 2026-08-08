@@ -53,6 +53,22 @@ const parsed = parseArgs({
       type: "string",
       default: "10",
     },
+    "log-path": {
+      type: "string",
+      default: "~/.codex/state/agents-md-watch-hook.log",
+    },
+    "log-max-bytes": {
+      type: "string",
+      default: "10485760",
+    },
+    "log-keep-files": {
+      type: "string",
+      default: "5",
+    },
+    "log-retention-days": {
+      type: "string",
+      default: "30",
+    },
     "hooks-json": {
       type: "string",
       default: "~/.codex/hooks.json",
@@ -73,6 +89,12 @@ const mode = readMode(parsed.values.mode);
 const stableDelaySeconds = readStableDelaySeconds(
   parsed.values["stable-delay-seconds"],
 );
+const logPath = expandHome(parsed.values["log-path"]);
+const logMaxBytes = readPositiveInteger(parsed.values["log-max-bytes"]);
+const logKeepFiles = readPositiveInteger(parsed.values["log-keep-files"]);
+const logRetentionDays = readPositiveInteger(
+  parsed.values["log-retention-days"],
+);
 const repoRoot = dirname(fileURLToPath(import.meta.url));
 const targetDir = expandHome(parsed.values["target-dir"]);
 const dbPath = expandHome(parsed.values["db-path"]);
@@ -84,6 +106,10 @@ const generatedHooks = buildHooksConfig(
   codexHome,
   mode,
   stableDelaySeconds,
+  logPath,
+  logMaxBytes,
+  logKeepFiles,
+  logRetentionDays,
 );
 
 if (parsed.values["print-only"]) {
@@ -108,6 +134,8 @@ const summary = [
   `codex home: ${codexHome}`,
   `模式: ${mode}`,
   `稳定等待: ${stableDelaySeconds}s`,
+  `日志路径: ${logPath}`,
+  `日志轮转大小: ${logMaxBytes} bytes, 保留 ${logKeepFiles} 个, 过期 ${logRetentionDays} 天`,
   `hooks.json: ${hooksMergeResult}`,
   `生成的 hooks 示例: ${generatedHooksPath}`,
 ];
@@ -132,6 +160,16 @@ function readStableDelaySeconds(value: string): number {
   return seconds;
 }
 
+function readPositiveInteger(value: string): number {
+  const number = Number(value);
+
+  if (!Number.isInteger(number) || number <= 0) {
+    throw new Error(`Unsupported positive integer: ${value}`);
+  }
+
+  return number;
+}
+
 function expandHome(pathText: string): string {
   if (pathText === "~") {
     return homedir();
@@ -150,11 +188,15 @@ function buildHooksConfig(
   codexHome: string,
   mode: WatchMode,
   stableDelaySeconds: number,
+  logPath: string,
+  logMaxBytes: number,
+  logKeepFiles: number,
+  logRetentionDays: number,
 ): HooksFile {
   const renderPosixCommand = (eventCommand: string) =>
-    `bun ${shellQuotePosix(installedHookPath)} ${eventCommand} --db-path ${shellQuotePosix(dbPath)} --codex-home ${shellQuotePosix(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
+    `bun ${shellQuotePosix(installedHookPath)} ${eventCommand} --db-path ${shellQuotePosix(dbPath)} --codex-home ${shellQuotePosix(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds} --log-path ${shellQuotePosix(logPath)} --log-max-bytes ${logMaxBytes} --log-keep-files ${logKeepFiles} --log-retention-days ${logRetentionDays}`;
   const renderWindowsCommand = (eventCommand: string) =>
-    `bun ${shellQuoteWindows(installedHookPath)} ${eventCommand} --db-path ${shellQuoteWindows(dbPath)} --codex-home ${shellQuoteWindows(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds}`;
+    `bun ${shellQuoteWindows(installedHookPath)} ${eventCommand} --db-path ${shellQuoteWindows(dbPath)} --codex-home ${shellQuoteWindows(codexHome)} --mode ${mode} --stable-delay-seconds ${stableDelaySeconds} --log-path ${shellQuoteWindows(logPath)} --log-max-bytes ${logMaxBytes} --log-keep-files ${logKeepFiles} --log-retention-days ${logRetentionDays}`;
 
   const hookCommand = (eventCommand: string) => ({
     type: "command" as const,

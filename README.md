@@ -79,6 +79,12 @@ bun run print:hooks
 - 文件再次变化并稳定后, 同一个 session 会收到新的提醒.
 - fork session 如果识别到父 session, 会继承父 session 已提醒或待稳定的观察状态.
 
+## 日志
+
+每次 hook 调用都会向默认的 `~/.codex/state/agents-md-watch-hook.log` 追加一行 JSON, 记录时间, 级别, 命令, session, 工作目录, 耗时, 提醒数量和错误信息.
+
+日志文件达到 `--log-max-bytes` 后按 `.1`, `.2` 方式轮转, 保留 `--log-keep-files` 个备份. 轮转时会删除超过 `--log-retention-days` 的旧备份.
+
 ## 数据库结构
 
 SQLite 文件默认位于 `~/.codex/state/agents-md-watch.sqlite3`.
@@ -153,6 +159,10 @@ SQLite 文件默认位于 `~/.codex/state/agents-md-watch.sqlite3`.
 - `--db-path`: 默认 `~/.codex/state/agents-md-watch.sqlite3`
 - `--mode`: `warn` 或 `strict`
 - `--stable-delay-seconds`: 默认 `10`
+- `--log-path`: 默认 `~/.codex/state/agents-md-watch-hook.log`
+- `--log-max-bytes`: 默认 `10485760`
+- `--log-keep-files`: 默认 `5`
+- `--log-retention-days`: 默认 `30`
 - `--hooks-json`: 默认 `~/.codex/hooks.json`
 - `--print-only`: 只打印配置, 不写文件
 
@@ -163,7 +173,11 @@ bun ./install.ts \
   --target-dir ~/.codex/agents-md-watch \
   --db-path ~/.codex/state/agents-md-watch.sqlite3 \
   --mode warn \
-  --stable-delay-seconds 10
+  --stable-delay-seconds 10 \
+  --log-path ~/.codex/state/agents-md-watch-hook.log \
+  --log-max-bytes 10485760 \
+  --log-keep-files 5 \
+  --log-retention-days 30
 ```
 
 ## 卸载
