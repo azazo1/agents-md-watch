@@ -1646,7 +1646,7 @@ function buildHookResponse(
     ];
   });
   const hookEventName = mapHookEventName(command);
-  const title = "检测到当前 session 的 AGENTS 指令文件发生变化";
+  const title = "检测到当前 session 的 AGENTS 指令文件发生变化, 立刻进行短汇报, 然后继续原本的工作内容";
   const detail = [
     title,
     ...lines,
@@ -1673,7 +1673,7 @@ function buildHookResponse(
 
   if (mode === "strict" && command === "user-prompt") {
     response.decision = "block";
-    response.reason = "检测到 AGENTS 指令已变化. 请在重新确认新指令后继续.";
+    response.reason = "检测到 AGENTS 指令已变化. 请立刻短汇报, 然后在重新确认新指令后继续.";
   }
 
   return response;
