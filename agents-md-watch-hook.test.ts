@@ -595,6 +595,53 @@ describe("agents watch hook", () => {
       readFileSync(logPath, "utf8").trim().split("\n").length,
     ).toBeGreaterThan(0);
   });
+
+  test("concurrent pre-tool hooks do not fail with database lock", async () => {
+    const ctx = createFixture({ stableDelayMs: 0 });
+    const payload = JSON.stringify({
+      sessionId: "session-concurrent",
+      cwd: ctx.cwd,
+    });
+    const hookPath = join(import.meta.dir, "agents-md-watch-hook.ts");
+    const spawnPreTool = () =>
+      Bun.spawn({
+        cmd: [
+          "bun",
+          hookPath,
+          "pre-tool",
+          "--db-path",
+          ctx.options.dbPath,
+          "--codex-home",
+          ctx.options.codexHome,
+          "--project-root",
+          ctx.options.projectRoot,
+          "--stable-delay-seconds",
+          "0",
+        ],
+        cwd: import.meta.dir,
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+    const processes = Array.from({ length: 6 }, () => spawnPreTool());
+
+    for (const process of processes) {
+      process.stdin.write(payload);
+      process.stdin.end();
+    }
+
+    const exitCodes = await Promise.all(
+      processes.map((process) => process.exited),
+    );
+    const stderrTexts = await Promise.all(
+      processes.map((process) => new Response(process.stderr).text()),
+    );
+    const failedProcesses = exitCodes
+      .map((code, index) => ({ code, stderr: stderrTexts[index] }))
+      .filter(({ code }) => code !== 0);
+
+    expect(failedProcesses).toEqual([]);
+  });
 });
 
 describe("agents watch installer", () => {

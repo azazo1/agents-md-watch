@@ -279,6 +279,28 @@ export function runHook(
   payload: HookPayload,
   options: RunHookOptions,
 ): RunHookResult {
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return runHookOnce(cliOptions, payload, options);
+    } catch (error) {
+      if (!isSqliteBusyError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+
+      Bun.sleepSync(attempt * 25);
+    }
+  }
+
+  throw new Error("unreachable");
+}
+
+function runHookOnce(
+  cliOptions: HookCliOptions,
+  payload: HookPayload,
+  options: RunHookOptions,
+): RunHookResult {
   const db = openDatabase(options.dbPath);
 
   try {
@@ -340,6 +362,17 @@ export function runHook(
   } finally {
     db.close();
   }
+}
+
+function isSqliteBusyError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return (
+    error.name === "SQLiteError" &&
+    error.message.includes("database is locked")
+  );
 }
 
 export function runHookWithLogging(
@@ -546,6 +579,27 @@ function openDatabase(dbPath: string): Database {
   }
 
   return db;
+}
+
+function withImmediateTransaction<T>(
+  db: Database,
+  callback: () => T,
+): T {
+  db.exec("BEGIN IMMEDIATE");
+
+  try {
+    const result = callback();
+    db.exec("COMMIT");
+    return result;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      // 忽略回滚失败, 保留原始错误.
+    }
+
+    throw error;
+  }
 }
 
 function ensureSchema(db: Database): void {
@@ -758,11 +812,11 @@ function seedSessionBaseline(db: Database, session: SessionContext): void {
     )
   `);
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const snapshot of snapshots) {
       insertFile.run(...trackedInsertValues(session.sessionKey, snapshot));
     }
-  })();
+  });
 }
 
 function hasTrackedFiles(db: Database, sessionKey: string): boolean {
@@ -841,7 +895,7 @@ function inheritTrackedFiles(
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const row of rows) {
       const mappedPath = mapInheritedPath(row, parentSession, session);
       const snapshot = snapshots.get(mappedPath);
@@ -896,7 +950,7 @@ function inheritTrackedFiles(
         row.last_change_at,
       );
     }
-  })();
+  });
 
   return true;
 }
@@ -997,25 +1051,14 @@ function seedMissingTrackedFiles(db: Database, session: SessionContext): void {
     )
   `);
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const snapshot of snapshots) {
       insertFile.run(...trackedInsertValues(session.sessionKey, snapshot));
     }
-  })();
+  });
 }
 
 function ensureSessionRow(db: Database, session: SessionContext, now: string): void {
-  const existing = db
-    .prepare("SELECT session_key FROM sessions WHERE session_key = ?")
-    .get(session.sessionKey) as { session_key: string } | null;
-
-  if (existing) {
-    db.prepare(
-      "UPDATE sessions SET cwd = ?, project_root = ?, codex_home = ?, status = 'active', ended_at = NULL WHERE session_key = ?",
-    ).run(session.cwd, session.projectRoot, session.codexHome, session.sessionKey);
-    return;
-  }
-
   db.prepare(`
     INSERT INTO sessions (
       session_key,
@@ -1026,6 +1069,12 @@ function ensureSessionRow(db: Database, session: SessionContext, now: string): v
       ended_at,
       status
     ) VALUES (?, ?, ?, ?, ?, NULL, 'active')
+    ON CONFLICT(session_key) DO UPDATE SET
+      cwd = excluded.cwd,
+      project_root = excluded.project_root,
+      codex_home = excluded.codex_home,
+      status = 'active',
+      ended_at = NULL
   `).run(
     session.sessionKey,
     session.cwd,
@@ -1134,7 +1183,7 @@ function checkForChanges(
   const alerts: AlertRecord[] = [];
   const sessionHadTrackedFiles = hasTrackedFiles(db, session.sessionKey);
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const snapshot of snapshots) {
       const existing = selectTracked.get(
         session.sessionKey,
@@ -1243,7 +1292,7 @@ function checkForChanges(
         now,
       );
     }
-  })();
+  });
 
   return alerts;
 }
@@ -1370,13 +1419,13 @@ function cleanupOldRecords(
     "DELETE FROM sessions WHERE session_key = ?",
   );
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const session of oldSessions) {
       deleteTrackedFiles.run(session.session_key);
       deleteAlerts.run(session.session_key);
       deleteSession.run(session.session_key);
     }
-  })();
+  });
 
   tryVacuumDatabase(db);
 }
